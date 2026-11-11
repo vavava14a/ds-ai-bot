@@ -7,59 +7,64 @@ import discord
 import aiohttp
 from aiohttp import web
 
-# ----------------- КОНФИГУРАЦИЯ И ТОКЕНЫ -----------------
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 
-# Пул моделей на основе ваших лимитов в AI Studio:
+# Пул моделей
 MODELS_POOL = [
-    # 1. Основные модели с поддержкой зрения (быстрые, 500 запросов в день)
     "gemini-3.5-flash-lite",
     "gemini-3.1-flash-lite",
-
-    # 2. Резервные Flash-модели со зрением
     "gemini-3.8-flash",
     "gemini-3.6-flash",
     "gemini-3-flash",
-    "gemini-2.5-flash-lite",
-    "gemini-2.5-flash",
-
-    # 3. Чисто текстовые модели с лимитом 14 400 запросов (используются для текста)
     "gemma-4-31b-it",
     "gemma-4-26b-it",
 ]
 
-# Расширения файлов кода и документов для текстового анализа:
 TEXT_EXTENSIONS = (
     ".txt", ".py", ".js", ".ts", ".json", ".html", ".css", 
     ".cpp", ".c", ".cs", ".java", ".go", ".rs", ".md", ".log", 
     ".xml", ".yaml", ".yml", ".sql", ".sh"
 )
 
-# Раздельная память: у каждого канала свой изолированный контекст диалога
+# Раздельная память каналов
 channel_memories = defaultdict(list)
 
 
-# ----------------- ФУНКЦИЯ ОБРАЩЕНИЯ К ИИ -----------------
 async def ask_ai(user_message: str, channel_id: int, file_parts: list = None) -> str:
     if not GEMINI_API_KEY:
         return "Ошибка: Не задан GEMINI_API_KEY в переменных окружения."
 
+    # Теперь бот помнит до 40 ПОЛНОЦЕННЫХ сообщений из диалога
     chat_memory = channel_memories[channel_id]
-    memory_text = "\n".join(chat_memory[-8:])
+    memory_text = "\n".join(chat_memory[-40:])
 
-    full_prompt = f"""Ты полезный ИИ-помощник на сервере в Discord.
-Если прикреплено изображение, документ или файл с кодом — внимательно изучи его и дай подробный ответ на вопрос пользователя.
-Отвечай понятно, дружелюбно, структурированно и на русском языке.
+    # Промпт: выбиваем из него повадки бота
+    full_prompt = f"""Ты участник Discord-сервера по имени стетхом.
 
-Последние сообщения в этом канале:
-{memory_text if memory_text else "(начало диалога)"}
+ТВОЙ ХАРАКТЕР И ПРАВИЛА (СТРОЖАЙШЕ СОБЛЮДАЙ):
+1. ЗАБУДЬ, ЧТО ТЫ РОБОТ ИЛИ ТЕХПОДДЕРЖКА. Общайся как реальный живой человек в голосовом/текстовом чате с друзьями — по-простому, иногда с иронией, без официоза.
+2. НИКАКИХ "Привет! 👋", "Здравствуйте", "Чем я могу вам помочь?", "Хотите обсудить что-то еще? 😉" в начале или конце! За такие фразы сразу бан. Отвечай СРАЗУ по делу с первого слова.
+3. НИКАКИХ нумерованных списков (1., 2., 3.), если тебя прямо не попросили составить список. Пиши нормальным сплошным текстом или предложениями, как люди в мессенджерах.
+4. ПАМЯТЬ: Ниже приведена реальная история чата. Если тебя спрашивают, о чем говорили или что было в начале — смотри в историю чата и пересказывай точно и по фактам, своими словами, а не сочиняй сказки.
+5. НЕ ПРИДУМЫВАЙ. Если не знаешь человека на фото, локальный мем или ответ — так прямо и скажи: "Хз кто это", "Не шарю за этот прикол, поясни". Не пытайся угадывать чушь.
 
-Запрос пользователя: {user_message}"""
+История текущего разговора на сервере:
+{memory_text if memory_text else "(Диалог только начинается)"}
+
+Новое сообщение от {user_message}"""
 
     headers = {
         "Content-Type": "application/json",
         "X-goog-api-key": GEMINI_API_KEY,
+    }
+
+    # Настройка: даем модели подумать (thinking) и снижаем температуру для ума
+    generation_config = {
+        "temperature": 0.5,
+        "thinkingConfig": {
+            "thinkingBudget": 1024  # Модель сначала обдумывает логику вопроса
+        }
     }
 
     last_error = None
@@ -67,7 +72,6 @@ async def ask_ai(user_message: str, channel_id: int, file_parts: list = None) ->
 
     async with aiohttp.ClientSession(timeout=timeout) as session:
         for model_name in MODELS_POOL:
-            # Если есть картинка или PDF, пропускаем чисто текстовые модели Gemma
             if file_parts and model_name.startswith("gemma"):
                 continue
 
@@ -77,7 +81,7 @@ async def ask_ai(user_message: str, channel_id: int, file_parts: list = None) ->
 
             payload = {
                 "contents": [{"parts": parts}],
-                "generationConfig": {"temperature": 0.7}
+                "generationConfig": generation_config
             }
 
             url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
@@ -86,32 +90,38 @@ async def ask_ai(user_message: str, channel_id: int, file_parts: list = None) ->
                 async with session.post(url, json=payload, headers=headers) as resp:
                     data = await resp.json(content_type=None)
 
-                    # Успешный ответ от ИИ
+                    # Если модель не поддерживает thinkingConfig (HTTP 400), шлем без него
+                    if resp.status == 400 and "thinkingConfig" in payload.get("generationConfig", {}):
+                        payload["generationConfig"] = {"temperature": 0.5}
+                        async with session.post(url, json=payload, headers=headers) as retry_resp:
+                            data = await retry_resp.json(content_type=None)
+                            resp = retry_resp
+
                     if resp.status == 200 and "candidates" in data and len(data["candidates"]) > 0:
                         cand_parts = data["candidates"][0].get("content", {}).get("parts", [])
+                        
+                        # Берем финальный ответ, отсекая внутренние мысли модели (thoughts)
                         for part in reversed(cand_parts):
                             if "text" in part and not part.get("thought", False):
-                                print(f"✅ Ответила модель: {model_name}", flush=True)
+                                print(f"✅ Ответила: {model_name}", flush=True)
                                 return part["text"].strip()
                         if cand_parts and "text" in cand_parts[-1]:
-                            print(f"✅ Ответила модель: {model_name}", flush=True)
                             return cand_parts[-1]["text"].strip()
 
                     err_msg = data.get("error", {}).get("message", f"HTTP {resp.status}")
                     last_error = f"{model_name}: {err_msg}"
-                    print(f"⚠️ Модель {model_name} не ответила ({err_msg[:50]}...), переключаюсь...", flush=True)
+                    print(f"⚠️ {model_name} ошибка: {err_msg[:50]}", flush=True)
 
             except Exception as e:
                 last_error = f"{model_name}: {str(e)}"
                 continue
 
-    return f"Ошибка ответа ИИ: `{last_error}`"
+    return f"Ошибка: `{last_error}`"
 
 
-# ----------------- ЛОГИКА ДИСКОРД-БОТА -----------------
 async def run_discord_bot():
     if not DISCORD_TOKEN:
-        print("❌ Ошибка: DISCORD_TOKEN не задан! Укажите его в переменных окружения.", flush=True)
+        print("❌ Ошибка: DISCORD_TOKEN не задан!", flush=True)
         return
 
     while True:
@@ -121,7 +131,7 @@ async def run_discord_bot():
 
         @client.event
         async def on_ready():
-            print(f"✅ Дискорд-бот {client.user} успешно запущен и готов к работе!", flush=True)
+            print(f"✅ Бот {client.user} онлайн с расширенной памятью!", flush=True)
 
         @client.event
         async def on_message(message):
@@ -136,11 +146,9 @@ async def run_discord_bot():
                 and message.reference.resolved.author == client.user
             )
 
-            # Реагируем на @упоминание или ответ (reply) на сообщение бота
             if is_mentioned or is_reply_to_bot:
                 clean_text = message.content.replace(f"<@{client.user.id}>", "").strip()
 
-                # Сбор всех вложений (из текущего сообщения или из цитируемого сообщения)
                 file_parts = []
                 attachments = list(message.attachments)
                 if message.reference and message.reference.resolved and isinstance(message.reference.resolved, discord.Message):
@@ -150,51 +158,35 @@ async def run_discord_bot():
                     filename = att.filename.lower()
                     content_type = att.content_type or ""
 
-                    # 1. Обработка картинок
                     if content_type.startswith("image/") or filename.endswith((".png", ".jpg", ".jpeg", ".webp")):
                         try:
                             file_bytes = await att.read()
                             b64 = base64.b64encode(file_bytes).decode("utf-8")
                             mime = content_type if content_type.startswith("image/") else "image/jpeg"
-                            file_parts.append({
-                                "inlineData": {
-                                    "mimeType": mime,
-                                    "data": b64
-                                }
-                            })
+                            file_parts.append({"inlineData": {"mimeType": mime, "data": b64}})
                         except Exception as e:
-                            print(f"Ошибка загрузки картинки: {e}", flush=True)
+                            print(f"Ошибка картинки: {e}")
 
-                    # 2. Обработка PDF-документов
                     elif filename.endswith(".pdf") or content_type == "application/pdf":
                         try:
                             file_bytes = await att.read()
                             b64 = base64.b64encode(file_bytes).decode("utf-8")
-                            file_parts.append({
-                                "inlineData": {
-                                    "mimeType": "application/pdf",
-                                    "data": b64
-                                }
-                            })
+                            file_parts.append({"inlineData": {"mimeType": "application/pdf", "data": b64}})
                         except Exception as e:
-                            print(f"Ошибка загрузки PDF: {e}", flush=True)
+                            print(f"Ошибка PDF: {e}")
 
-                    # 3. Обработка текстовых файлов и кода
                     elif filename.endswith(TEXT_EXTENSIONS):
                         try:
                             file_bytes = await att.read()
                             text_content = file_bytes.decode("utf-8", errors="replace")
                             file_parts.append({
-                                "text": f"\n\n--- Файл [{att.filename}] ---\n{text_content}\n--- Конец файла ---\n"
+                                "text": f"\n\n[Файл {att.filename}]:\n{text_content}\n"
                             })
                         except Exception as e:
-                            print(f"Ошибка чтения текстового файла: {e}", flush=True)
+                            print(f"Ошибка файла: {e}")
 
                 if not clean_text:
-                    if file_parts:
-                        clean_text = "Проанализируй прикрепленный файл и расскажи подробно, что в нем."
-                    else:
-                        clean_text = "Привет!"
+                    clean_text = "Что на прикрепленном файле?" if file_parts else "Ты тут?"
 
                 async with message.channel.typing():
                     answer = await ask_ai(
@@ -203,15 +195,14 @@ async def run_discord_bot():
                         file_parts=file_parts
                     )
 
-                # Сохраняем историю в памяти именно этого канала
-                if not answer.startswith("Ошибка ответа ИИ:"):
+                # Сохраняем в память канала до 50 сообщений БЕЗ обрезания!
+                if not answer.startswith("Ошибка:"):
                     memory = channel_memories[message.channel.id]
                     memory.append(f"{message.author.display_name}: {clean_text}")
-                    memory.append(f"Бот: {answer[:300]}")
-                    if len(memory) > 12:
-                        del memory[:-12]
+                    memory.append(f"стетхом: {answer}")
+                    if len(memory) > 50:
+                        del memory[:-50]
 
-                # Обход лимита сообщений Discord (2000 знаков)
                 for i in range(0, len(answer), 1990):
                     await message.reply(answer[i:i+1990])
 
@@ -219,15 +210,14 @@ async def run_discord_bot():
             await client.start(DISCORD_TOKEN)
         except discord.errors.HTTPException as e:
             await client.close()
-            print(f"⚠️ Ограничение сети Discord ({e.status}). Ждем 5 минут...", flush=True)
+            print(f"⚠️ Лимит сети ({e.status}). Ждем 5 минут...", flush=True)
             await asyncio.sleep(300)
         except Exception as e:
             await client.close()
-            print(f"⚠️ Ошибка бота: {e}. Перезапуск через 30 секунд...", flush=True)
+            print(f"⚠️ Ошибка: {e}. Перезапуск через 30 сек...", flush=True)
             await asyncio.sleep(30)
 
 
-# ----------------- ВЕБ-СЕРВЕР ДЛЯ RENDER И CRON-JOB -----------------
 async def handle(request):
     return web.Response(text="Discord Bot is alive 24/7!")
 
@@ -240,7 +230,7 @@ async def main():
     port = int(os.environ.get("PORT", 8080))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    print(f"🌐 Сервер мониторинга слушает порт: {port}", flush=True)
+    print(f"🌐 Порт веб-сервера: {port}", flush=True)
 
     await run_discord_bot()
 
