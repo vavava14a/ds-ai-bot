@@ -5,15 +5,12 @@ import discord
 import aiohttp
 from aiohttp import web
 
+# Токены берутся из переменных окружения (Environment) на Render
+# Локально можно задать их в системе или временно вставить в кавычки вторым аргументом:
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 
-# Твой проверенный рабочий ключ:
-GEMINI_API_KEY = "AQ.Ab8RN6JfTYbuFm6ZNWr7TNWmZNA81FAT42Kgx81w4B3bxj4W6A"
-
-# Твой проверенный рабочий скрипт:
-GOOGLE_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbxmxYQjk8Msrtpv5MwzhKzZBmWGqQy4rkgY6sRCYa34Z7hGWOsEcx3NA-Q8i_SHtBEA/exec"
-
-# Все модели, где у тебя на скриншоте большие лимиты (500 и 14 400 в день):
+# Рабочий пул моделей (gemini-3.5-flash-lite как основная)
 MODELS_POOL = [
     "gemini-3.5-flash-lite",
     "gemini-3.1-flash-lite",
@@ -24,6 +21,9 @@ MODELS_POOL = [
 chat_memory = []
 
 async def ask_ai(user_message: str) -> str:
+    if not GEMINI_API_KEY:
+        return "Ошибка: Не задан GEMINI_API_KEY в переменных окружения."
+
     memory_text = "\n".join(chat_memory[-10:])
     full_prompt = f"""Ты умный и полезный ИИ-помощник на сервере в Discord. Отвечай понятно, по делу и на русском языке.
 
@@ -33,39 +33,44 @@ async def ask_ai(user_message: str) -> str:
 Запрос пользователя: {user_message}"""
 
     payload = {
-        "contents": [{"role": "user", "parts": [{"text": full_prompt}]}],
-        "generationConfig": {"temperature": 0.8},
+        "contents": [
+            {
+                "parts": [{"text": full_prompt}]
+            }
+        ],
+        "generationConfig": {
+            "temperature": 0.8
+        }
     }
-    safe_json_bytes = json.dumps(payload, ensure_ascii=True).encode("ascii")
+
+    headers = {
+        "Content-Type": "application/json",
+        "X-goog-api-key": GEMINI_API_KEY,
+    }
 
     last_error = None
-    timeout = aiohttp.ClientTimeout(total=90)
+    timeout = aiohttp.ClientTimeout(total=45)
 
     async with aiohttp.ClientSession(timeout=timeout) as session:
         for model_name in MODELS_POOL:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
             try:
-                url = f"{GOOGLE_SCRIPT_URL.strip()}?key={GEMINI_API_KEY.strip()}&model={model_name}"
-                async with session.post(
-                    url,
-                    data=safe_json_bytes,
-                    headers={"Content-Type": "application/json"},
-                    allow_redirects=True
-                ) as resp:
+                async with session.post(url, json=payload, headers=headers) as resp:
                     data = await resp.json(content_type=None)
 
-                    if data and "candidates" in data and len(data["candidates"]) > 0:
-                        parts = (
-                            data["candidates"][0]
-                            .get("content", {})
-                            .get("parts", [])
-                        )
+                    # Успешный ответ
+                    if resp.status == 200 and "candidates" in data and len(data["candidates"]) > 0:
+                        parts = data["candidates"][0].get("content", {}).get("parts", [])
                         for part in reversed(parts):
                             if "text" in part and not part.get("thought", False):
                                 return part["text"].strip()
                         if parts and "text" in parts[-1]:
                             return parts[-1]["text"].strip()
-                    else:
-                        last_error = data
+
+                    # Если модель перегружена (503), уперлась в лимит (429) или недоступна — пробуем следующую
+                    last_error = data.get("error", {}).get("message", data)
+                    print(f"⚠️ Модель {model_name} вернула ошибку, переключаюсь: {last_error}")
+
             except Exception as e:
                 last_error = str(e)
                 continue
@@ -74,6 +79,10 @@ async def ask_ai(user_message: str) -> str:
 
 
 async def run_discord_bot():
+    if not DISCORD_TOKEN:
+        print("❌ Ошибка: DISCORD_TOKEN не задан! Задайте его в переменных окружения.", flush=True)
+        return
+
     while True:
         intents = discord.Intents.default()
         intents.message_content = True
@@ -81,7 +90,7 @@ async def run_discord_bot():
 
         @client.event
         async def on_ready():
-            print(f"✅ Дискорд-бот {client.user} в сети и готов к работе!", flush=True)
+            print(f"✅ Дискорд-бот {client.user} успешно запущен и готов к ответам!", flush=True)
 
         @client.event
         async def on_message(message):
@@ -95,6 +104,7 @@ async def run_discord_bot():
                 and message.reference.resolved.author == client.user
             )
 
+            # Бот реагирует на упоминание (@бот) или ответ на его сообщение
             if is_mentioned or is_reply_to_bot:
                 clean_text = message.content.replace(f"<@{client.user.id}>", "").strip()
                 if not clean_text:
@@ -109,6 +119,7 @@ async def run_discord_bot():
                     if len(chat_memory) > 12:
                         del chat_memory[:-12]
 
+                # Обход лимита Discord в 2000 знаков на сообщение
                 for i in range(0, len(answer), 1990):
                     await message.reply(answer[i:i+1990])
 
@@ -116,14 +127,15 @@ async def run_discord_bot():
             await client.start(DISCORD_TOKEN)
         except discord.errors.HTTPException as e:
             await client.close()
-            print(f"⚠️ Временный лимит IP от Discord ({e.status}). Ждём 5 минут...", flush=True)
+            print(f"⚠️ Ограничение сети Discord ({e.status}). Ожидание 5 минут...", flush=True)
             await asyncio.sleep(300)
         except Exception as e:
             await client.close()
-            print(f"⚠️ Ошибка: {e}. Перезапуск через 60 секунд...", flush=True)
-            await asyncio.sleep(60)
+            print(f"⚠️ Сбой: {e}. Перезапуск через 30 секунд...", flush=True)
+            await asyncio.sleep(30)
 
 
+# Веб-сервер для поддержания активности на Render
 async def handle(request):
     return web.Response(text="Discord Bot is alive 24/7!")
 
@@ -132,10 +144,11 @@ async def main():
     app.router.add_get("/", handle)
     runner = web.AppRunner(app)
     await runner.setup()
+
     port = int(os.environ.get("PORT", 8080))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    print(f"🌐 Веб-сервер запущен на порту {port}", flush=True)
+    print(f"🌐 Веб-сервер пинга слушает порт: {port}", flush=True)
 
     await run_discord_bot()
 
