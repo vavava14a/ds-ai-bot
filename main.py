@@ -5,21 +5,22 @@ import discord
 import aiohttp
 from aiohttp import web
 
-# Токен бота Discord (берётся из настроек Environment на Render)
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 
-# Твой новый ключ от ИИ Google:
-GEMINI_API_KEY = "AQ.Ab8RN6KH8F_PNyMocm9TDq3kdlw9YeVB0Qfpe4DiHKnA7yL0rA"
+# Твой проверенный рабочий ключ:
+GEMINI_API_KEY = "AQ.Ab8RN6JfTYbuFm6ZNWr7TNWmZNA81FAT42Kgx81w4B3bxj4W6A"
 
-# Список моделей (если одна перегружена, сразу ответит следующая)
+# Твой проверенный рабочий скрипт:
+GOOGLE_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbxmxYQjk8Msrtpv5MwzhKzZBmWGqQy4rkgY6sRCYa34Z7hGWOsEcx3NA-Q8i_SHtBEA/exec"
+
+# Все модели, где у тебя на скриншоте большие лимиты (500 и 14 400 в день):
 MODELS_POOL = [
-    "gemini-2.5-flash-lite",
-    "gemini-2.0-flash-lite",
-    "gemini-2.5-flash",
-    "gemini-2.0-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-3.1-flash-lite",
+    "gemma-4-26b-it",
+    "gemma-4-31b-it",
 ]
 
-# Память диалога для Discord
 chat_memory = []
 
 async def ask_ai(user_message: str) -> str:
@@ -35,20 +36,29 @@ async def ask_ai(user_message: str) -> str:
         "contents": [{"role": "user", "parts": [{"text": full_prompt}]}],
         "generationConfig": {"temperature": 0.8},
     }
+    safe_json_bytes = json.dumps(payload, ensure_ascii=True).encode("ascii")
 
     last_error = None
-    timeout = aiohttp.ClientTimeout(total=25)
+    timeout = aiohttp.ClientTimeout(total=90)
 
     async with aiohttp.ClientSession(timeout=timeout) as session:
         for model_name in MODELS_POOL:
-            # Прямой запрос к серверам Google напрямую с хостинга Render (США)
-            url = f"https://aiplatform.googleapis.com/v1/publishers/google/models/{model_name}:generateContent?key={GEMINI_API_KEY}"
             try:
-                async with session.post(url, json=payload) as resp:
+                url = f"{GOOGLE_SCRIPT_URL.strip()}?key={GEMINI_API_KEY.strip()}&model={model_name}"
+                async with session.post(
+                    url,
+                    data=safe_json_bytes,
+                    headers={"Content-Type": "application/json"},
+                    allow_redirects=True
+                ) as resp:
                     data = await resp.json(content_type=None)
 
                     if data and "candidates" in data and len(data["candidates"]) > 0:
-                        parts = data["candidates"][0].get("content", {}).get("parts", [])
+                        parts = (
+                            data["candidates"][0]
+                            .get("content", {})
+                            .get("parts", [])
+                        )
                         for part in reversed(parts):
                             if "text" in part and not part.get("thought", False):
                                 return part["text"].strip()
@@ -78,7 +88,6 @@ async def run_discord_bot():
             if message.author.bot:
                 return
 
-            # Отвечает, если бота тегнули (@стетхом) или ответили (Reply) на его сообщение
             is_mentioned = client.user in message.mentions
             is_reply_to_bot = (
                 message.reference
@@ -115,7 +124,6 @@ async def run_discord_bot():
             await asyncio.sleep(60)
 
 
-# Мини веб-сервер, чтобы Render и cron-job держали бота включённым 24/7
 async def handle(request):
     return web.Response(text="Discord Bot is alive 24/7!")
 
