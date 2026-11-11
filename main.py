@@ -2,15 +2,14 @@ import os
 import json
 import base64
 import asyncio
+from collections import defaultdict
 import discord
 import aiohttp
 from aiohttp import web
 
-# Токены:
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 
-# Рабочий пул моделей:
 MODELS_POOL = [
     "gemini-3.5-flash-lite",
     "gemini-3.1-flash-lite",
@@ -18,33 +17,41 @@ MODELS_POOL = [
     "gemma-4-31b-it",
 ]
 
-chat_memory = []
+# Текстовые форматы, которые бот декодирует как код/текст:
+TEXT_EXTENSIONS = (
+    ".txt", ".py", ".js", ".json", ".html", ".css", 
+    ".cpp", ".c", ".cs", ".java", ".md", ".log", ".xml", ".yaml", ".yml"
+)
 
-async def ask_ai(user_message: str, image_parts: list = None) -> str:
+# Раздельная память: для каждого канала своя история сообщений
+channel_memories = defaultdict(list)
+
+
+async def ask_ai(user_message: str, channel_id: int, file_parts: list = None) -> str:
     if not GEMINI_API_KEY:
         return "Ошибка: Не задан GEMINI_API_KEY в переменных окружения."
 
+    chat_memory = channel_memories[channel_id]
     memory_text = "\n".join(chat_memory[-8:])
-    full_prompt = f"""Ты умный и полезный ИИ-помощник на сервере в Discord. 
-Если к сообщению прикреплено изображение — внимательно изучи его и ответь на вопрос пользователя.
-Отвечай понятно, по делу и на русском языке.
+    
+    full_prompt = f"""Ты умный и полезный ИИ-помощник на сервере в Discord.
+Если прикреплены файлы, код или документы — внимательно проанализируй их и ответь на вопрос пользователя.
+При необходимости используй поиск в интернете, чтобы давать актуальную информацию.
+Отвечай понятно, структурированно и на русском языке.
 
-Последние сообщения в чате:
+Последние сообщения в этом канале:
 {memory_text if memory_text else "(начало диалога)"}
 
 Запрос пользователя: {user_message}"""
 
-    # Собираем части запроса: сначала текст, затем прикрепленные изображения
     parts = [{"text": full_prompt}]
-    if image_parts:
-        parts.extend(image_parts)
+    if file_parts:
+        parts.extend(file_parts)
 
     payload = {
-        "contents": [
-            {
-                "parts": parts
-            }
-        ],
+        "contents": [{"parts": parts}],
+        # Включаем живой поиск в Google:
+        "tools": [{"google_search": {}}],
         "generationConfig": {
             "temperature": 0.7
         }
@@ -74,7 +81,7 @@ async def ask_ai(user_message: str, image_parts: list = None) -> str:
                             return cand_parts[-1]["text"].strip()
 
                     last_error = data.get("error", {}).get("message", data)
-                    print(f"⚠️ Модель {model_name} вернула ошибку, переключаюсь: {last_error}")
+                    print(f"⚠️ Модель {model_name} вернула ошибку: {last_error}")
 
             except Exception as e:
                 last_error = str(e)
@@ -95,7 +102,7 @@ async def run_discord_bot():
 
         @client.event
         async def on_ready():
-            print(f"✅ Дискорд-бот {client.user} в сети и готов видеть картинки!", flush=True)
+            print(f"✅ Бот {client.user} готов! (Поиск в Google + Чтение PDF и кода)", flush=True)
 
         @client.event
         async def on_message(message):
@@ -112,45 +119,66 @@ async def run_discord_bot():
 
             if is_mentioned or is_reply_to_bot:
                 clean_text = message.content.replace(f"<@{client.user.id}>", "").strip()
-                if not clean_text:
-                    clean_text = "Что изображено на картинке?"
 
-                # 1. Поиск прикрепленных картинок (в текущем сообщении или в цитате)
-                image_parts = []
-                attachments_to_check = list(message.attachments)
-
-                # Если пользователь ответил на сообщение с картинкой:
+                # Сбор вложений из текущего сообщения или из реплая
+                file_parts = []
+                attachments = list(message.attachments)
                 if message.reference and message.reference.resolved and isinstance(message.reference.resolved, discord.Message):
-                    attachments_to_check.extend(message.reference.resolved.attachments)
+                    attachments.extend(message.reference.resolved.attachments)
 
-                for att in attachments_to_check:
-                    # Проверяем, что файл — изображение
+                for att in attachments:
+                    filename = att.filename.lower()
                     content_type = att.content_type or ""
-                    if content_type.startswith("image/") or att.filename.lower().endswith((".png", ".jpg", ".jpeg", ".webp")):
+
+                    # 1. Картинки
+                    if content_type.startswith("image/") or filename.endswith((".png", ".jpg", ".jpeg", ".webp")):
                         try:
-                            img_data = await att.read()
-                            b64_image = base64.b64encode(img_data).decode("utf-8")
+                            file_bytes = await att.read()
+                            b64 = base64.b64encode(file_bytes).decode("utf-8")
                             mime = content_type if content_type.startswith("image/") else "image/jpeg"
-                            image_parts.append({
-                                "inline_data": {
-                                    "mime_type": mime,
-                                    "data": b64_image
-                                }
+                            file_parts.append({"inline_data": {"mime_type": mime, "data": b64}})
+                        except Exception as e:
+                            print(f"Ошибка картинки: {e}")
+
+                    # 2. PDF документы
+                    elif filename.endswith(".pdf") or content_type == "application/pdf":
+                        try:
+                            file_bytes = await att.read()
+                            b64 = base64.b64encode(file_bytes).decode("utf-8")
+                            file_parts.append({"inline_data": {"mime_type": "application/pdf", "data": b64}})
+                        except Exception as e:
+                            print(f"Ошибка чтения PDF: {e}")
+
+                    # 3. Файлы кода и текстовые документы (.py, .txt, .json и др.)
+                    elif filename.endswith(TEXT_EXTENSIONS):
+                        try:
+                            file_bytes = await att.read()
+                            # Читаем текст файла с авто-определением кодировки UTF-8
+                            text_content = file_bytes.decode("utf-8", errors="replace")
+                            file_parts.append({
+                                "text": f"\n\n--- Содержимое прикрепленного файла [{att.filename}] ---\n{text_content}\n--- Конец файла ---\n"
                             })
-                        except Exception as err:
-                            print(f"Не удалось скачать картинку: {err}")
+                        except Exception as e:
+                            print(f"Ошибка чтения файла с кодом: {e}")
 
-                # 2. Индикация набора текста и запрос к ИИ
+                if not clean_text:
+                    if file_parts:
+                        clean_text = "Проанализируй прикрепленный файл и расскажи главное."
+                    else:
+                        clean_text = "Привет!"
+
                 async with message.channel.typing():
-                    answer = await ask_ai(f"{message.author.display_name}: {clean_text}", image_parts=image_parts)
+                    answer = await ask_ai(f"{message.author.display_name}: {clean_text}", message.channel.id, file_parts=file_parts)
 
+                # Сохраняем историю в памяти именно этого канала
                 if not answer.startswith("Ошибка ответа ИИ:"):
-                    chat_memory.append(f"{message.author.display_name}: {clean_text}")
-                    chat_memory.append(f"Бот: {answer[:300]}")
-                    if len(chat_memory) > 12:
-                        del chat_memory[:-12]
+                    memory = channel_memories[message.channel.id]
+                    memory.append(f"{message.author.display_name}: {clean_text}")
+                    memory.append(f"Бот: {answer[:300]}")
+                    if len(memory) > 12:
+                        del memory[:-12]
 
-                # Отправка ответа (с разделением, если текст длинный)
+                # Отправка ответа (разбивка длинных сообщений)
                 for i in range(0, len(answer), 1990):
                     await message.reply(answer[i:i+1990])
 
@@ -158,7 +186,7 @@ async def run_discord_bot():
             await client.start(DISCORD_TOKEN)
         except discord.errors.HTTPException as e:
             await client.close()
-            print(f"⚠️ Ограничение сети Discord ({e.status}). Ожидание 5 минут...", flush=True)
+            print(f"⚠️ Ограничение Discord ({e.status}). Ждём 5 минут...", flush=True)
             await asyncio.sleep(300)
         except Exception as e:
             await client.close()
