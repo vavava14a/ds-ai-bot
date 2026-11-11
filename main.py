@@ -1,20 +1,18 @@
 import os
 import json
+import asyncio
 import discord
 import aiohttp
 from aiohttp import web
 
-DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 
-# Рабочие настройки прямиком из твоего бота для Твича:
 GOOGLE_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbxmxYQjk8Msrtpv5MwzhKzZBmWGqQy4rkgY6sRCYa34Z7hGWOsEcx3NA-Q8i_SHtBEA/exec"
 DEFAULT_KEY = "AQ.Ab8RN6JOmjCIa_EV6ZbldIgELj-6qOvB5nFpKN10XJs3-hHlRQ"
 
-# Если на Render в GEMINI_KEY указан ключ на AIzaSy..., берём его, иначе берём ключ из Твич-бота
 env_key = os.getenv("GEMINI_KEY", "").strip()
 GEMINI_API_KEY = env_key if env_key.startswith("AIza") else DEFAULT_KEY
 
-# Пул моделей (если одна занята или недоступна, мгновенно ответит следующая)
 MODELS_POOL = [
     "gemini-2.5-flash",
     "gemini-2.5-flash-lite",
@@ -24,11 +22,6 @@ MODELS_POOL = [
     "gemma-4-31b-it",
 ]
 
-intents = discord.Intents.default()
-intents.message_content = True
-client = discord.Client(intents=intents)
-
-# Память последних сообщений, чтобы бот помнил контекст разговора
 chat_memory = []
 
 async def ask_ai(user_message: str) -> str:
@@ -77,43 +70,60 @@ async def ask_ai(user_message: str) -> str:
                 last_error = str(e)
                 continue
 
-    return f"Не удалось получить ответ от моделей. Последняя ошибка: `{last_error}`"
+    return f"Не удалось получить ответ от ИИ. Детали: `{last_error}`"
 
-@client.event
-async def on_ready():
-    print(f"Бот {client.user} успешно запущен и готов отвечать!")
 
-@client.event
-async def on_message(message):
-    if message.author.bot:
-        return
+async def run_discord_bot():
+    while True:
+        intents = discord.Intents.default()
+        intents.message_content = True
+        client = discord.Client(intents=intents)
 
-    is_mentioned = client.user in message.mentions
-    is_reply_to_bot = (
-        message.reference 
-        and message.reference.resolved 
-        and message.reference.resolved.author == client.user
-    )
+        @client.event
+        async def on_ready():
+            print(f"✅ Бот {client.user} успешно подключился к Discord и готов отвечать!")
 
-    if is_mentioned or is_reply_to_bot:
-        clean_text = message.content.replace(f"<@{client.user.id}>", "").strip()
-        if not clean_text:
-            clean_text = "Привет!"
+        @client.event
+        async def on_message(message):
+            if message.author.bot:
+                return
 
-        async with message.channel.typing():
-            answer = await ask_ai(f"{message.author.display_name}: {clean_text}")
+            is_mentioned = client.user in message.mentions
+            is_reply_to_bot = (
+                message.reference
+                and message.reference.resolved
+                and message.reference.resolved.author == client.user
+            )
 
-        # Сохраняем в память только успешные ответы
-        if not answer.startswith("Не удалось получить ответ"):
-            chat_memory.append(f"{message.author.display_name}: {clean_text}")
-            chat_memory.append(f"Бот: {answer[:300]}")
-            if len(chat_memory) > 12:
-                del chat_memory[:-12]
+            if is_mentioned or is_reply_to_bot:
+                clean_text = message.content.replace(f"<@{client.user.id}>", "").strip()
+                if not clean_text:
+                    clean_text = "Привет!"
 
-        for i in range(0, len(answer), 1990):
-            await message.reply(answer[i:i+1990])
+                async with message.channel.typing():
+                    answer = await ask_ai(f"{message.author.display_name}: {clean_text}")
 
-# Веб-сервер для работы 24/7 на Render
+                if not answer.startswith("Не удалось получить ответ"):
+                    chat_memory.append(f"{message.author.display_name}: {clean_text}")
+                    chat_memory.append(f"Бот: {answer[:300]}")
+                    if len(chat_memory) > 12:
+                        del chat_memory[:-12]
+
+                for i in range(0, len(answer), 1990):
+                    await message.reply(answer[i:i+1990])
+
+        try:
+            await client.start(DISCORD_TOKEN)
+        except discord.errors.HTTPException as e:
+            await client.close()
+            print(f"⚠️ Временный лимит IP от Discord Cloudflare (статус {e.status}). Ждём 5 минут перед повтором...")
+            await asyncio.sleep(300)
+        except Exception as e:
+            await client.close()
+            print(f"⚠️ Ошибка: {e}. Перезапуск через 60 секунд...")
+            await asyncio.sleep(60)
+
+
 async def handle(request):
     return web.Response(text="Bot is alive 24/7!")
 
@@ -125,9 +135,9 @@ async def main():
     port = int(os.environ.get("PORT", 8080))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
+    print(f"🌐 Веб-сервер запущен на порту {port}")
 
-    await client.start(DISCORD_TOKEN)
+    await run_discord_bot()
 
 if __name__ == "__main__":
-    import asyncio
     asyncio.run(main())
