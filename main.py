@@ -5,84 +5,62 @@ import discord
 import aiohttp
 from aiohttp import web
 
+# Токен бота Discord (берётся из настроек Environment на Render)
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 
-# Твоя новая ссылка из скриншота Google Apps Script уже вставлена сюда:
-GOOGLE_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbzKhZluY1Tjgh6meYJvtygVcdZ-GRLgFcTYyq03S7pZ8Fi8ecT7F7L3JcEN-p3NcnFk/exec"
-GEMINI_API_KEY = os.getenv("GEMINI_KEY", "AQ.Ab8RN6JOmjCIa_EV6ZbldIgELj-6qOvB5nFpKN10XJs3-hHlRQ").strip()
+# Твой новый ключ от ИИ Google:
+GEMINI_API_KEY = "AQ.Ab8RN6KH8F_PNyMocm9TDq3kdlw9YeVB0Qfpe4DiHKnA7yL0rA"
 
+# Список моделей (если одна перегружена, сразу ответит следующая)
 MODELS_POOL = [
-    "gemini-2.5-flash",
     "gemini-2.5-flash-lite",
+    "gemini-2.0-flash-lite",
+    "gemini-2.5-flash",
     "gemini-2.0-flash",
-    "gemma-3-27b-it",
 ]
 
+# Память диалога для Discord
 chat_memory = []
 
 async def ask_ai(user_message: str) -> str:
     memory_text = "\n".join(chat_memory[-10:])
-    system_prompt = "Ты умный, чёткий и полезный ИИ-помощник в Discord. Отвечай понятно, по делу и на русском языке."
-    full_prompt = f"""Контекст предыдущих сообщений:
+    full_prompt = f"""Ты умный и полезный ИИ-помощник на сервере в Discord. Отвечай понятно, по делу и на русском языке.
+
+Последние сообщения в чате:
 {memory_text if memory_text else "(начало диалога)"}
 
 Запрос пользователя: {user_message}"""
 
-    timeout = aiohttp.ClientTimeout(total=25)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        # 1. Пробуем через твой скрипт Google Apps Script
-        payload = {
-            "contents": [{"role": "user", "parts": [{"text": f"{system_prompt}\n\n{full_prompt}"}]}],
-            "generationConfig": {"temperature": 0.7},
-        }
-        safe_json_bytes = json.dumps(payload, ensure_ascii=True).encode("ascii")
+    payload = {
+        "contents": [{"role": "user", "parts": [{"text": full_prompt}]}],
+        "generationConfig": {"temperature": 0.8},
+    }
 
+    last_error = None
+    timeout = aiohttp.ClientTimeout(total=25)
+
+    async with aiohttp.ClientSession(timeout=timeout) as session:
         for model_name in MODELS_POOL:
+            # Прямой запрос к серверам Google напрямую с хостинга Render (США)
+            url = f"https://aiplatform.googleapis.com/v1/publishers/google/models/{model_name}:generateContent?key={GEMINI_API_KEY}"
             try:
-                url = f"{GOOGLE_SCRIPT_URL}?key={GEMINI_API_KEY}&model={model_name}"
-                async with session.post(
-                    url,
-                    data=safe_json_bytes,
-                    headers={"Content-Type": "application/json"},
-                    allow_redirects=True
-                ) as resp:
+                async with session.post(url, json=payload) as resp:
                     data = await resp.json(content_type=None)
-                    if "candidates" in data and len(data["candidates"]) > 0:
+
+                    if data and "candidates" in data and len(data["candidates"]) > 0:
                         parts = data["candidates"][0].get("content", {}).get("parts", [])
                         for part in reversed(parts):
                             if "text" in part and not part.get("thought", False):
                                 return part["text"].strip()
-                    # Если ошибка в ключе (400/401), не ждём остальные модели, сразу переходим к резервному ИИ
-                    if "error" in data and data["error"].get("code") in (400, 401, 403):
-                        break
-            except Exception:
-                break
+                        if parts and "text" in parts[-1]:
+                            return parts[-1]["text"].strip()
+                    else:
+                        last_error = data
+            except Exception as e:
+                last_error = str(e)
+                continue
 
-        # 2. Встроенный бесплатный ИИ без ключей (срабатывает автоматически!)
-        try:
-            free_payload = {
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": full_prompt}
-                ],
-                "model": "openai"
-            }
-            async with session.post(
-                "https://text.pollinations.ai/",
-                json=free_payload,
-                headers={"Content-Type": "application/json"}
-            ) as resp:
-                if resp.status == 200:
-                    text = (await resp.text()).strip()
-                    if text.startswith("{") and "choices" in text:
-                        parsed = json.loads(text)
-                        return parsed["choices"][0]["message"]["content"].strip()
-                    if text:
-                        return text
-        except Exception as e:
-            return f"Ошибка соединения с ИИ: `{e}`"
-
-    return "Не удалось получить ответ от ИИ, попробуй ещё раз через пару секунд."
+    return f"Ошибка ответа ИИ: `{last_error}`"
 
 
 async def run_discord_bot():
@@ -93,13 +71,14 @@ async def run_discord_bot():
 
         @client.event
         async def on_ready():
-            print(f"✅ Бот {client.user} успешно подключился к Discord и готов отвечать!", flush=True)
+            print(f"✅ Дискорд-бот {client.user} в сети и готов к работе!", flush=True)
 
         @client.event
         async def on_message(message):
             if message.author.bot:
                 return
 
+            # Отвечает, если бота тегнули (@стетхом) или ответили (Reply) на его сообщение
             is_mentioned = client.user in message.mentions
             is_reply_to_bot = (
                 message.reference
@@ -115,10 +94,11 @@ async def run_discord_bot():
                 async with message.channel.typing():
                     answer = await ask_ai(f"{message.author.display_name}: {clean_text}")
 
-                chat_memory.append(f"{message.author.display_name}: {clean_text}")
-                chat_memory.append(f"Бот: {answer[:300]}")
-                if len(chat_memory) > 12:
-                    del chat_memory[:-12]
+                if not answer.startswith("Ошибка ответа ИИ:"):
+                    chat_memory.append(f"{message.author.display_name}: {clean_text}")
+                    chat_memory.append(f"Бот: {answer[:300]}")
+                    if len(chat_memory) > 12:
+                        del chat_memory[:-12]
 
                 for i in range(0, len(answer), 1990):
                     await message.reply(answer[i:i+1990])
@@ -127,7 +107,7 @@ async def run_discord_bot():
             await client.start(DISCORD_TOKEN)
         except discord.errors.HTTPException as e:
             await client.close()
-            print(f"⚠️ Временный лимит IP от Discord Cloudflare ({e.status}). Ждём 5 минут...", flush=True)
+            print(f"⚠️ Временный лимит IP от Discord ({e.status}). Ждём 5 минут...", flush=True)
             await asyncio.sleep(300)
         except Exception as e:
             await client.close()
@@ -135,8 +115,9 @@ async def run_discord_bot():
             await asyncio.sleep(60)
 
 
+# Мини веб-сервер, чтобы Render и cron-job держали бота включённым 24/7
 async def handle(request):
-    return web.Response(text="Bot is alive 24/7!")
+    return web.Response(text="Discord Bot is alive 24/7!")
 
 async def main():
     app = web.Application()
