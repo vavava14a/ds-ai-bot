@@ -61,6 +61,10 @@ PERSONAS = {
             "Ты максимально ленивый зумер на чилле. Сленг: 'пон', 'жиза', 'кринж', 'вайб', 'база'. "
             "Пиши маленькими буквами, без знаков препинания, кратко и расслабленно."
         )
+    },
+    "custom": {
+        "name": "✍️ Свой кастомный промпт",
+        "prompt": ""
     }
 }
 
@@ -87,9 +91,17 @@ async def init_db():
                 model TEXT DEFAULT 'auto',
                 persona TEXT DEFAULT 'statham',
                 web_search INTEGER DEFAULT 1,
-                spontaneous INTEGER DEFAULT 1
+                spontaneous INTEGER DEFAULT 1,
+                custom_prompt TEXT DEFAULT ''
             )
         """)
+        # Миграция: добавляем столбец, если база уже существовала
+        try:
+            await db.execute("ALTER TABLE channel_settings ADD COLUMN custom_prompt TEXT DEFAULT ''")
+            await db.commit()
+        except Exception:
+            pass
+
         await db.execute("""
             CREATE TABLE IF NOT EXISTS channel_memory (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -114,11 +126,23 @@ async def init_db():
 
 async def get_settings(channel_id: int) -> dict:
     async with aiosqlite.connect(DB_FILE) as db:
-        async with db.execute("SELECT model, persona, web_search, spontaneous FROM channel_settings WHERE channel_id = ?", (channel_id,)) as cur:
+        async with db.execute("SELECT model, persona, web_search, spontaneous, custom_prompt FROM channel_settings WHERE channel_id = ?", (channel_id,)) as cur:
             row = await cur.fetchone()
             if row:
-                return {"model": row[0], "persona": row[1], "web_search": bool(row[2]), "spontaneous": bool(row[3])}
-            return {"model": "auto", "persona": "statham", "web_search": True, "spontaneous": True}
+                return {
+                    "model": row[0],
+                    "persona": row[1],
+                    "web_search": bool(row[2]),
+                    "spontaneous": bool(row[3]),
+                    "custom_prompt": row[4] or ""
+                }
+            return {
+                "model": "auto",
+                "persona": "statham",
+                "web_search": True,
+                "spontaneous": True,
+                "custom_prompt": ""
+            }
 
 
 async def update_setting(channel_id: int, key: str, value):
@@ -126,14 +150,22 @@ async def update_setting(channel_id: int, key: str, value):
     settings[key] = value
     async with aiosqlite.connect(DB_FILE) as db:
         await db.execute("""
-            INSERT INTO channel_settings (channel_id, model, persona, web_search, spontaneous)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO channel_settings (channel_id, model, persona, web_search, spontaneous, custom_prompt)
+            VALUES (?, ?, ?, ?, ?, ?)
             ON CONFLICT(channel_id) DO UPDATE SET
                 model = excluded.model,
                 persona = excluded.persona,
                 web_search = excluded.web_search,
-                spontaneous = excluded.spontaneous
-        """, (channel_id, settings["model"], settings["persona"], int(settings["web_search"]), int(settings["spontaneous"])))
+                spontaneous = excluded.spontaneous,
+                custom_prompt = excluded.custom_prompt
+        """, (
+            channel_id,
+            settings["model"],
+            settings["persona"],
+            int(settings["web_search"]),
+            int(settings["spontaneous"]),
+            settings["custom_prompt"]
+        ))
         await db.commit()
 
 
@@ -291,7 +323,38 @@ def split_text_with_markdown(text: str, limit: int = 1950) -> list[str]:
     return chunks
 
 
-# ==================== UI: ИНТЕРАКТИВНОЕ МЕНЮ И КНОПКИ ====================
+# ==================== UI: ОКНО ВВОДА ПРОМПТА И МЕНЮ ====================
+class CustomPromptModal(discord.ui.Modal, title="Кастомный системный промпт"):
+    prompt_input = discord.ui.TextInput(
+        label="Системный промпт для этого канала",
+        style=discord.TextStyle.paragraph,
+        placeholder="Например: Ты эксперт по кибербезопасности. Отвечай кратко, профессионально и по делу...",
+        max_length=3500,
+        required=False
+    )
+
+    def __init__(self, current_prompt: str):
+        super().__init__()
+        self.prompt_input.default = current_prompt
+
+    async def on_submit(self, interaction: discord.Interaction):
+        new_prompt = self.prompt_input.value.strip()
+        await update_setting(interaction.channel_id, "custom_prompt", new_prompt)
+        if new_prompt:
+            await update_setting(interaction.channel_id, "persona", "custom")
+            msg = "✅ **Кастомный системный промпт сохранен и активирован!**"
+        else:
+            await update_setting(interaction.channel_id, "persona", "statham")
+            msg = "ℹ️ Промпт очищен. Канал переключен на характер Стетхома."
+
+        settings = await get_settings(interaction.channel_id)
+        embed = build_menu_embed(settings)
+        try:
+            await interaction.response.send_message(msg, embed=embed, ephemeral=True)
+        except Exception:
+            await interaction.response.send_message(msg, ephemeral=True)
+
+
 class RunCodeButtonView(discord.ui.View):
     def __init__(self, language: str, code: str):
         super().__init__(timeout=300)
@@ -333,6 +396,10 @@ class ControlPanelView(discord.ui.View):
         await clear_channel_memory(interaction.channel_id)
         await interaction.response.send_message("🧹 Память диалога в этом канале очищена!", ephemeral=True)
 
+    @discord.ui.button(label="✍️ Задать свой промпт", style=discord.ButtonStyle.primary, row=3)
+    async def open_prompt_modal(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(CustomPromptModal(self.settings["custom_prompt"]))
+
     async def refresh_view(self, interaction: discord.Interaction):
         embed = build_menu_embed(self.settings)
         try:
@@ -364,10 +431,17 @@ class PersonaDropdown(discord.ui.Select):
             discord.SelectOption(label=p["name"], value=k, default=(current == k))
             for k, p in PERSONAS.items()
         ]
-        super().__init__(placeholder="Выберите характер...", min_values=1, max_values=1, options=options, row=1)
+        super().__init__(placeholder="Выберите характер или кастом...", min_values=1, max_values=1, options=options, row=1)
 
     async def callback(self, interaction: discord.Interaction):
-        await update_setting(interaction.channel_id, "persona", self.values[0])
+        val = self.values[0]
+        settings = await get_settings(interaction.channel_id)
+        if val == "custom" and not settings["custom_prompt"]:
+            # Если выбран кастом, но промпт пустой — сразу открываем окно ввода
+            await interaction.response.send_modal(CustomPromptModal(""))
+            return
+
+        await update_setting(interaction.channel_id, "persona", val)
         settings = await get_settings(interaction.channel_id)
         embed = build_menu_embed(settings)
         try:
@@ -377,24 +451,31 @@ class PersonaDropdown(discord.ui.Select):
 
 
 def build_menu_embed(settings: dict) -> discord.Embed:
-    p_name = PERSONAS.get(settings["persona"], {}).get("name", settings["persona"])
+    p_key = settings["persona"]
+    if p_key == "custom":
+        custom_txt = settings["custom_prompt"]
+        p_name = f"✍️ Свой промпт: {custom_txt[:40]}..." if custom_txt else "✍️ Свой промпт (пустой)"
+    else:
+        p_name = PERSONAS.get(p_key, {}).get("name", p_key)
+
     embed = discord.Embed(title="⚙️ Центр управления Стетхомом", color=discord.Color.blue())
     embed.add_field(name="🤖 Активная модель", value=f"`{settings['model']}`", inline=True)
     embed.add_field(name="🎭 Характер", value=f"**{p_name}**", inline=True)
     embed.add_field(name="🌐 Поиск Google", value="✅ Включен" if settings["web_search"] else "❌ Выключен", inline=True)
     embed.add_field(name="🎲 Спонтанность", value="✅ 3% шанс" if settings["spontaneous"] else "❌ Выключена", inline=True)
-    embed.set_footer(text="Изменения применяются для текущего канала.")
+    embed.set_footer(text="Все настройки сохраняются для этого канала.")
     return embed
 
 
 def build_menu_text(settings: dict) -> str:
-    p_name = PERSONAS.get(settings["persona"], {}).get("name", settings["persona"])
+    p_key = settings["persona"]
+    p_name = "✍️ Свой промпт" if p_key == "custom" else PERSONAS.get(p_key, {}).get("name", p_key)
     return (
         f"⚙️ **Центр управления Стетхомом**\n"
         f"• 🤖 **Модель:** `{settings['model']}`\n"
         f"• 🎭 **Характер:** {p_name}\n"
-        f"• 🌐 **Поиск Google:** {'✅ Включен' if settings['web_search'] else '❌ Выключен'}\n"
-        f"• 🎲 **Спонтанность:** {'✅ Включена' if settings['spontaneous'] else '❌ Выключена'}"
+        f"• 🌐 **Поиск Google:** {'✅ Включен' if settings["web_search"] else '❌ Выключен'}\n"
+        f"• 🎲 **Спонтанность:** {'✅ Включена' if settings["spontaneous"] else '❌ Выключена'}"
     )
 
 
@@ -447,13 +528,19 @@ async def ask_ai(author: discord.User | discord.Member, user_text: str, channel:
         http_session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=45))
 
     settings = await get_settings(channel.id)
-    persona_cfg = PERSONAS.get(settings["persona"], PERSONAS["statham"])
+
+    # Выбор базового системного промпта (кастомный или готовый)
+    if settings["persona"] == "custom" and settings["custom_prompt"]:
+        base_prompt = settings["custom_prompt"]
+    else:
+        persona_cfg = PERSONAS.get(settings["persona"], PERSONAS["statham"])
+        base_prompt = persona_cfg["prompt"]
 
     dossier = await get_user_facts(channel.guild.id if channel.guild else 0, author.id)
     dossier_text = f"\nДосье на собеседника ({author.display_name}):\n{dossier}" if dossier else ""
     vc_context = f"\n[Ты находишься в голосовом канале: {channel.name}]" if isinstance(channel, discord.VoiceChannel) else ""
 
-    system_instruction = f"{persona_cfg['prompt']}{dossier_text}{vc_context}"
+    system_instruction = f"{base_prompt}{dossier_text}{vc_context}"
 
     history = await get_memory(channel.id)
     current_parts = [{"text": f"[{author.display_name}]: {user_text}"}]
@@ -526,6 +613,18 @@ async def slash_menu(interaction: discord.Interaction):
         await interaction.response.send_message(content=build_menu_text(settings), view=ControlPanelView(settings), ephemeral=True)
 
 
+@bot.tree.command(name="prompt", description="Задать кастомный системный промпт для этого канала")
+@app_commands.describe(text="Новый промпт (оставь пустым, чтобы открыть окно ввода)")
+async def slash_prompt(interaction: discord.Interaction, text: str = None):
+    settings = await get_settings(interaction.channel_id)
+    if text is None:
+        await interaction.response.send_modal(CustomPromptModal(settings["custom_prompt"]))
+    else:
+        await update_setting(interaction.channel_id, "custom_prompt", text.strip())
+        await update_setting(interaction.channel_id, "persona", "custom")
+        await interaction.response.send_message("✅ **Кастомный системный промпт установлен и активирован!**", ephemeral=True)
+
+
 @bot.tree.command(name="quote", description="Сделать мем-цитату")
 @app_commands.describe(text="Текст цитаты (если пусто — придумает сам)")
 async def slash_quote(interaction: discord.Interaction, text: str = None):
@@ -593,7 +692,7 @@ async def on_message(message: discord.Message):
             and message.reference.resolved.author == bot.user
         )
 
-        # 🎯 ЖЕЛЕЗНЫЙ ПЕРЕХВАТ МЕНЮ:
+        # 🎯 ЖЕЛЕЗНЫЙ ПЕРЕХВАТ МЕНЮ
         is_menu_command = (
             "!menu" in content_lower 
             or "/menu" in content_lower
@@ -602,6 +701,22 @@ async def on_message(message: discord.Message):
 
         if is_menu_command:
             await send_control_panel(message)
+            return
+
+        # Текстовая команда для быстрой смены промпта: !prompt <текст>
+        if message.content.startswith("!prompt"):
+            prompt_arg = message.content[7:].strip()
+            if prompt_arg:
+                await update_setting(message.channel.id, "custom_prompt", prompt_arg)
+                await update_setting(message.channel.id, "persona", "custom")
+                await message.reply("✅ **Кастомный системный промпт установлен и активирован для этого канала!**")
+            else:
+                settings = await get_settings(message.channel.id)
+                current = settings["custom_prompt"] or "(не задан, используется дефолтный характер)"
+                await message.reply(
+                    f"📜 **Текущий промпт канала:**\n```\n{current}\n```\n"
+                    f"Чтобы задать новый, напиши: `!prompt <твой текст>` или используй команду `/prompt`."
+                )
             return
 
         # Цитата по реплаю: "!quote" в ответ на чужое сообщение
