@@ -95,7 +95,6 @@ async def init_db():
                 custom_prompt TEXT DEFAULT ''
             )
         """)
-        # Миграция: добавляем столбец, если база уже существовала
         try:
             await db.execute("ALTER TABLE channel_settings ADD COLUMN custom_prompt TEXT DEFAULT ''")
             await db.commit()
@@ -323,12 +322,12 @@ def split_text_with_markdown(text: str, limit: int = 1950) -> list[str]:
     return chunks
 
 
-# ==================== UI: ОКНО ВВОДА ПРОМПТА И МЕНЮ ====================
+# ==================== UI: ИНТЕРАКТИВНОЕ МЕНЮ И МОДАЛКА ====================
 class CustomPromptModal(discord.ui.Modal, title="Кастомный системный промпт"):
     prompt_input = discord.ui.TextInput(
         label="Системный промпт для этого канала",
         style=discord.TextStyle.paragraph,
-        placeholder="Например: Ты эксперт по кибербезопасности. Отвечай кратко, профессионально и по делу...",
+        placeholder="Например: Ты эксперт по IT. Отвечай кратко, профессионально и по делу...",
         max_length=3500,
         required=False
     )
@@ -437,7 +436,6 @@ class PersonaDropdown(discord.ui.Select):
         val = self.values[0]
         settings = await get_settings(interaction.channel_id)
         if val == "custom" and not settings["custom_prompt"]:
-            # Если выбран кастом, но промпт пустой — сразу открываем окно ввода
             await interaction.response.send_modal(CustomPromptModal(""))
             return
 
@@ -458,11 +456,14 @@ def build_menu_embed(settings: dict) -> discord.Embed:
     else:
         p_name = PERSONAS.get(p_key, {}).get("name", p_key)
 
+    search_status = "✅ Включен" if settings.get("web_search") else "❌ Выключен"
+    spont_status = "✅ 3% шанс" if settings.get("spontaneous") else "❌ Выключена"
+
     embed = discord.Embed(title="⚙️ Центр управления Стетхомом", color=discord.Color.blue())
     embed.add_field(name="🤖 Активная модель", value=f"`{settings['model']}`", inline=True)
     embed.add_field(name="🎭 Характер", value=f"**{p_name}**", inline=True)
-    embed.add_field(name="🌐 Поиск Google", value="✅ Включен" if settings["web_search"] else "❌ Выключен", inline=True)
-    embed.add_field(name="🎲 Спонтанность", value="✅ 3% шанс" if settings["spontaneous"] else "❌ Выключена", inline=True)
+    embed.add_field(name="🌐 Поиск Google", value=search_status, inline=True)
+    embed.add_field(name="🎲 Спонтанность", value=spont_status, inline=True)
     embed.set_footer(text="Все настройки сохраняются для этого канала.")
     return embed
 
@@ -470,12 +471,15 @@ def build_menu_embed(settings: dict) -> discord.Embed:
 def build_menu_text(settings: dict) -> str:
     p_key = settings["persona"]
     p_name = "✍️ Свой промпт" if p_key == "custom" else PERSONAS.get(p_key, {}).get("name", p_key)
+    search_status = "✅ Включен" if settings.get("web_search") else "❌ Выключен"
+    spont_status = "✅ Включена" if settings.get("spontaneous") else "❌ Выключена"
+
     return (
         f"⚙️ **Центр управления Стетхомом**\n"
         f"• 🤖 **Модель:** `{settings['model']}`\n"
         f"• 🎭 **Характер:** {p_name}\n"
-        f"• 🌐 **Поиск Google:** {'✅ Включен' if settings["web_search"] else '❌ Выключен'}\n"
-        f"• 🎲 **Спонтанность:** {'✅ Включена' if settings["spontaneous"] else '❌ Выключена'}"
+        f"• 🌐 **Поиск Google:** {search_status}\n"
+        f"• 🎲 **Спонтанность:** {spont_status}"
     )
 
 
@@ -529,7 +533,6 @@ async def ask_ai(author: discord.User | discord.Member, user_text: str, channel:
 
     settings = await get_settings(channel.id)
 
-    # Выбор базового системного промпта (кастомный или готовый)
     if settings["persona"] == "custom" and settings["custom_prompt"]:
         base_prompt = settings["custom_prompt"]
     else:
@@ -703,7 +706,7 @@ async def on_message(message: discord.Message):
             await send_control_panel(message)
             return
 
-        # Текстовая команда для быстрой смены промпта: !prompt <текст>
+        # Быстрая смена промпта через текст
         if message.content.startswith("!prompt"):
             prompt_arg = message.content[7:].strip()
             if prompt_arg:
@@ -719,7 +722,7 @@ async def on_message(message: discord.Message):
                 )
             return
 
-        # Цитата по реплаю: "!quote" в ответ на чужое сообщение
+        # Цитата по реплаю
         if message.content.strip().lower() == "!quote" and message.reference and message.reference.resolved:
             orig = message.reference.resolved
             if isinstance(orig, discord.Message) and orig.content:
@@ -728,7 +731,7 @@ async def on_message(message: discord.Message):
                 await message.reply(file=discord.File(buf, filename="quote.png"))
                 return
 
-        # Быстрый запуск кода через markdown: !run ```python print(123)```
+        # Быстрый запуск кода
         if message.content.startswith("!run"):
             match = re.search(r"```(\w*)\n([\s\S]*?)```", message.content)
             if match:
@@ -737,7 +740,7 @@ async def on_message(message: discord.Message):
                 await message.reply(f"```\n{out}\n```")
                 return
 
-        # Эмодзи-реакции на триггеры
+        # Эмодзи-реакции
         if any(w in clean_lower for w in ("кринж", "база", "стетхом одобряет", "пон", "жиза")):
             try:
                 await message.add_reaction(random.choice(["🗿", "💀", "🤝", "🤡", "☕"]))
@@ -746,7 +749,7 @@ async def on_message(message: discord.Message):
 
         settings = await get_settings(message.channel.id)
 
-        # Спонтанные реплики с кулдауном 15 минут
+        # Спонтанные реплики
         now = time.time()
         last_time = channel_spontaneous_cooldown[message.channel.id]
         trigger_spontaneous = (
@@ -765,7 +768,7 @@ async def on_message(message: discord.Message):
 
         user_query = message.clean_content.replace(f"@{bot.user.display_name}", "").strip()
 
-        # Сбор файлов (изображения, аудио/голосовые, pdf, код)
+        # Сбор файлов (включая аудио и голосовые)
         file_parts = []
         attachments = list(message.attachments)
         if message.reference and isinstance(message.reference.resolved, discord.Message):
@@ -791,7 +794,7 @@ async def on_message(message: discord.Message):
             except Exception as e:
                 print(f"Ошибка чтения файла: {e}")
 
-        # Парсинг ссылок из сообщения
+        # Парсинг ссылок
         urls = re.findall(r"https?://[^\s]+", user_query)
         for u in urls[:2]:
             page_text = await fetch_web_page(u)
@@ -804,12 +807,10 @@ async def on_message(message: discord.Message):
         async with message.channel.typing():
             answer, sources = await ask_ai(message.author, user_query, message.channel, file_parts)
 
-        # Добавляем ссылки на источники Google Search
         if sources:
             source_links = "\n".join([f"• [{title}]({uri})" for title, uri in sources[:4]])
             answer += f"\n\n🌐 **Источники:**\n{source_links}"
 
-        # Кнопка запуска кода, если ответ содержит код
         code_match = re.search(r"```(\w+)\n([\s\S]*?)```", answer)
         run_view = RunCodeButtonView(code_match.group(1), code_match.group(2)) if code_match else None
 
