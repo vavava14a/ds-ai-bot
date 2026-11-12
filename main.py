@@ -38,7 +38,7 @@ PERSONAS = {
         "prompt": (
             "Ты Джейсон Стетхом. Общайся как брутальный пацан с улицы и верный друг в Discord-чате. "
             "Отвечай коротко, по делу, с жесткой иронией, иногда вставляй абсурдные пацанские цитаты. "
-            "Никакого официоза и соплей. Отвечай сразу с первого слова."
+            "Никакого официоза, никакого 'Чем я могу вам помочь?'. Отвечай сразу с первого слова."
         )
     },
     "senior": {
@@ -185,7 +185,28 @@ async def save_user_fact(guild_id: int, user_id: int, user_name: str, fact: str)
         await db.commit()
 
 
-# ==================== УТИЛИТЫ И ВСПОМОГАТЕЛЬНЫЙ КОД ====================
+async def wipe_user_dossier(guild_id: int, user_id: int):
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute("DELETE FROM user_dossier WHERE guild_id = ? AND user_id = ?", (guild_id, user_id))
+        await db.commit()
+
+
+# ==================== УТИЛИТЫ: PISTON, PILLOW, СЕТЬ ====================
+async def fetch_web_page(url: str) -> str:
+    try:
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+        async with http_session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+            if resp.status == 200 and "text/html" in (resp.content_type or ""):
+                html = await resp.text()
+                clean = re.sub(r"<(script|style).*?>.*?</\1>", "", html, flags=re.DOTALL | re.IGNORECASE)
+                clean = re.sub(r"<[^>]+>", " ", clean)
+                clean = " ".join(clean.split())
+                return clean[:3000]
+    except Exception:
+        pass
+    return ""
+
+
 async def run_piston_code(language: str, code: str) -> str:
     url = "https://emkc.org/api/v2/piston/execute"
     lang_map = {
@@ -270,7 +291,22 @@ def split_text_with_markdown(text: str, limit: int = 1950) -> list[str]:
     return chunks
 
 
-# ==================== UI: ПАНЕЛЬ УПРАВЛЕНИЯ ====================
+# ==================== UI: ИНТЕРАКТИВНОЕ МЕНЮ И КНОПКИ ====================
+class RunCodeButtonView(discord.ui.View):
+    def __init__(self, language: str, code: str):
+        super().__init__(timeout=300)
+        self.language = language
+        self.code = code
+
+    @discord.ui.button(label="▶️ Запустить код", style=discord.ButtonStyle.success)
+    async def run_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
+        out = await run_piston_code(self.language, self.code)
+        if len(out) > 1850:
+            out = out[:1850] + "\n... (хвост обрезан)"
+        await interaction.followup.send(f"💻 **Результат запуска ({self.language}):**\n```\n{out}\n```")
+
+
 class ControlPanelView(discord.ui.View):
     def __init__(self, settings: dict):
         super().__init__(timeout=180)
@@ -363,7 +399,6 @@ def build_menu_text(settings: dict) -> str:
 
 
 async def send_control_panel(target_message: discord.Message):
-    """Надежная отправка панели настроек с защитой от отсутствия прав на Embed."""
     settings = await get_settings(target_message.channel.id)
     view = ControlPanelView(settings)
     try:
@@ -466,7 +501,7 @@ async def ask_ai(author: discord.User | discord.Member, user_text: str, channel:
     return warning_notice + "❌ Все доступные модели исчерпали лимиты.", []
 
 
-# ==================== DISCORD СОБЫТИЯ ====================
+# ==================== DISCORD СОБЫТИЯ И КОМАНДЫ ====================
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
@@ -478,8 +513,8 @@ async def on_ready():
     try:
         await bot.tree.sync()
     except Exception as e:
-        print(f"Ошибка синхронизации дерева команд: {e}")
-    print(f"✅ Бот {bot.user} успешно запущен и готов к работе!", flush=True)
+        print(f"Ошибка дерева команд: {e}")
+    print(f"✅ Бот {bot.user} готов к работе!", flush=True)
 
 
 @bot.tree.command(name="menu", description="Открыть центр управления Стетхомом")
@@ -491,42 +526,64 @@ async def slash_menu(interaction: discord.Interaction):
         await interaction.response.send_message(content=build_menu_text(settings), view=ControlPanelView(settings), ephemeral=True)
 
 
+@bot.tree.command(name="quote", description="Сделать мем-цитату")
+@app_commands.describe(text="Текст цитаты (если пусто — придумает сам)")
+async def slash_quote(interaction: discord.Interaction, text: str = None):
+    await interaction.response.defer()
+    author_name = "Джейсон Стетхом"
+    av_bytes = None
+
+    if not text:
+        text, _ = await ask_ai(interaction.user, "Выдай одну абсурдную пацанскую цитату в одно короткое предложение.", interaction.channel)
+
+    buf = create_quote_card(text.replace("«", "").replace("»", ""), author_name, av_bytes)
+    await interaction.followup.send(file=discord.File(buf, filename="quote.png"))
+
+
+@bot.tree.command(name="dossier", description="Посмотреть досье на участника")
+@app_commands.describe(user="Пользователь")
+async def slash_dossier(interaction: discord.Interaction, user: discord.Member = None):
+    target = user or interaction.user
+    facts = await get_user_facts(interaction.guild_id, target.id)
+    if not facts:
+        await interaction.response.send_message(f"📁 Досье на **{target.display_name}** пока пустое.", ephemeral=True)
+    else:
+        embed = discord.Embed(title=f"📁 Досье: {target.display_name}", description=facts, color=discord.Color.dark_gold())
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="remember", description="Записать факт в досье")
+@app_commands.describe(user="Пользователь", fact="Что запомнить?")
+async def slash_remember(interaction: discord.Interaction, user: discord.Member, fact: str):
+    await save_user_fact(interaction.guild_id, user.id, user.display_name, fact)
+    await interaction.response.send_message(f"📝 Записал в досье на **{user.display_name}**: *{fact}*", ephemeral=True)
+
+
+@bot.tree.command(name="forget", description="Очистить досье на пользователя")
+@app_commands.describe(user="Пользователь")
+async def slash_forget(interaction: discord.Interaction, user: discord.Member):
+    await wipe_user_dossier(interaction.guild_id, user.id)
+    await interaction.response.send_message(f"🗑️ Досье на **{user.display_name}** очищено.", ephemeral=True)
+
+
+@bot.tree.command(name="run", description="Запустить код в песочнице")
+@app_commands.describe(language="Язык (python, js, cpp, rust, bash)", code="Код")
+async def slash_run(interaction: discord.Interaction, language: str, code: str):
+    await interaction.response.defer()
+    out = await run_piston_code(language, code)
+    if len(out) > 1850:
+        out = out[:1850] + "\n..."
+    await interaction.followup.send(f"💻 **Результат ({language}):**\n```\n{out}\n```")
+
+
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot:
         return
 
     try:
-        content_raw = message.content.strip().lower()
-        clean_text = message.clean_content.strip().lower()
-
-        # --- НАДЕЖНЫЙ ПЕРЕХВАТ МЕНЮ ---
-        is_menu_request = (
-            content_raw in ("!menu", "/menu")
-            or "!menu" in content_raw
-            or clean_text in ("!menu", "/menu", "меню")
-            or ("меню" in clean_text and (bot.user in message.mentions or (message.reference and message.reference.resolved and message.reference.resolved.author == bot.user)))
-        )
-
-        if is_menu_request:
-            await send_control_panel(message)
-            return
-
-        # Быстрый запуск кода
-        if message.content.startswith("!run"):
-            match = re.search(r"```(\w*)\n([\s\S]*?)```", message.content)
-            if match:
-                lang, code = match.group(1) or "python", match.group(2)
-                out = await run_piston_code(lang, code)
-                await message.reply(f"```\n{out}\n```")
-                return
-
-        # Эмодзи-реакции на триггеры
-        if any(w in clean_text for w in ("кринж", "база", "стетхом одобряет", "пон", "жиза")):
-            try:
-                await message.add_reaction(random.choice(["🗿", "💀", "🤝", "🤡", "☕"]))
-            except Exception:
-                pass
+        content_lower = message.content.lower()
+        clean_lower = message.clean_content.lower()
 
         is_mentioned = bot.user in message.mentions
         is_reply = (
@@ -536,9 +593,45 @@ async def on_message(message: discord.Message):
             and message.reference.resolved.author == bot.user
         )
 
+        # 🎯 ЖЕЛЕЗНЫЙ ПЕРЕХВАТ МЕНЮ:
+        is_menu_command = (
+            "!menu" in content_lower 
+            or "/menu" in content_lower
+            or ((is_mentioned or is_reply) and any(w in clean_lower for w in ("меню", "menu", "настройки", "панель")))
+        )
+
+        if is_menu_command:
+            await send_control_panel(message)
+            return
+
+        # Цитата по реплаю: "!quote" в ответ на чужое сообщение
+        if message.content.strip().lower() == "!quote" and message.reference and message.reference.resolved:
+            orig = message.reference.resolved
+            if isinstance(orig, discord.Message) and orig.content:
+                av_data = await orig.author.display_avatar.read() if orig.author.display_avatar else None
+                buf = create_quote_card(orig.content, orig.author.display_name, av_data)
+                await message.reply(file=discord.File(buf, filename="quote.png"))
+                return
+
+        # Быстрый запуск кода через markdown: !run ```python print(123)```
+        if message.content.startswith("!run"):
+            match = re.search(r"```(\w*)\n([\s\S]*?)```", message.content)
+            if match:
+                lang, code = match.group(1) or "python", match.group(2)
+                out = await run_piston_code(lang, code)
+                await message.reply(f"```\n{out}\n```")
+                return
+
+        # Эмодзи-реакции на триггеры
+        if any(w in clean_lower for w in ("кринж", "база", "стетхом одобряет", "пон", "жиза")):
+            try:
+                await message.add_reaction(random.choice(["🗿", "💀", "🤝", "🤡", "☕"]))
+            except Exception:
+                pass
+
         settings = await get_settings(message.channel.id)
 
-        # Спонтанные реплики (раз в 15 минут)
+        # Спонтанные реплики с кулдауном 15 минут
         now = time.time()
         last_time = channel_spontaneous_cooldown[message.channel.id]
         trigger_spontaneous = (
@@ -557,7 +650,7 @@ async def on_message(message: discord.Message):
 
         user_query = message.clean_content.replace(f"@{bot.user.display_name}", "").strip()
 
-        # Сбор файлов (включая аудио и голосовые)
+        # Сбор файлов (изображения, аудио/голосовые, pdf, код)
         file_parts = []
         attachments = list(message.attachments)
         if message.reference and isinstance(message.reference.resolved, discord.Message):
@@ -583,22 +676,35 @@ async def on_message(message: discord.Message):
             except Exception as e:
                 print(f"Ошибка чтения файла: {e}")
 
+        # Парсинг ссылок из сообщения
+        urls = re.findall(r"https?://[^\s]+", user_query)
+        for u in urls[:2]:
+            page_text = await fetch_web_page(u)
+            if page_text:
+                file_parts.append({"text": f"\n\n[Содержимое страницы {u}]:\n{page_text}\n"})
+
         if not user_query:
             user_query = "Что на файле/аудио?" if file_parts else "Ты тут?"
 
         async with message.channel.typing():
             answer, sources = await ask_ai(message.author, user_query, message.channel, file_parts)
 
+        # Добавляем ссылки на источники Google Search
         if sources:
             source_links = "\n".join([f"• [{title}]({uri})" for title, uri in sources[:4]])
             answer += f"\n\n🌐 **Источники:**\n{source_links}"
 
+        # Кнопка запуска кода, если ответ содержит код
+        code_match = re.search(r"```(\w+)\n([\s\S]*?)```", answer)
+        run_view = RunCodeButtonView(code_match.group(1), code_match.group(2)) if code_match else None
+
         chunks = split_text_with_markdown(answer)
         for i, chunk in enumerate(chunks):
+            view_to_attach = run_view if (i == len(chunks) - 1 and run_view) else None
             if i == 0:
-                await message.reply(chunk)
+                await message.reply(chunk, view=view_to_attach)
             else:
-                await message.channel.send(chunk)
+                await message.channel.send(chunk, view=view_to_attach)
 
     except Exception as e:
         print(f"❌ Ошибка в on_message: {e}", flush=True)
@@ -619,6 +725,7 @@ async def main():
     await runner.setup()
     port = int(os.environ.get("PORT", 8080))
     await web.TCPSite(runner, "0.0.0.0", port).start()
+    print(f"🌐 Keep-alive сервер на порту: {port}", flush=True)
 
     try:
         await bot.start(DISCORD_TOKEN)
