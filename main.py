@@ -7,7 +7,6 @@ import random
 import textwrap
 import asyncio
 from collections import defaultdict
-from urllib.parse import urlparse
 
 import discord
 from discord import app_commands
@@ -59,7 +58,7 @@ PERSONAS = {
     "chill": {
         "name": "Чилловый Зумер 🤙",
         "prompt": (
-            "Ты максимально ленивый зумер на чилле. Сленг: 'пон', 'жиза', 'кринж', 'вайб', 'тянет на базу'. "
+            "Ты максимально ленивый зумер на чилле. Сленг: 'пон', 'жиза', 'кринж', 'вайб', 'база'. "
             "Пиши маленькими буквами, без знаков препинания, кратко и расслабленно."
         )
     }
@@ -186,31 +185,7 @@ async def save_user_fact(guild_id: int, user_id: int, user_name: str, fact: str)
         await db.commit()
 
 
-async def wipe_user_dossier(guild_id: int, user_id: int):
-    async with aiosqlite.connect(DB_FILE) as db:
-        await db.execute("DELETE FROM user_dossier WHERE guild_id = ? AND user_id = ?", (guild_id, user_id))
-        await db.commit()
-
-
-# ==================== УТИЛИТЫ: WEB-ПАРСИНГ, PISTON, PILLOW ====================
-async def fetch_web_page(url: str) -> str:
-    """Извлекает текстовое содержание страницы для скармливания модели."""
-    try:
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-        async with http_session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=8)) as resp:
-            if resp.status == 200 and "text/html" in (resp.content_type or ""):
-                html = await resp.text()
-                # Удаляем скрипты и стили
-                clean = re.sub(r"<(script|style).*?>.*?</\1>", "", html, flags=re.DOTALL | re.IGNORECASE)
-                # Удаляем HTML-теги
-                clean = re.sub(r"<[^>]+>", " ", clean)
-                clean = " ".join(clean.split())
-                return clean[:3000]
-    except Exception:
-        pass
-    return ""
-
-
+# ==================== УТИЛИТЫ И ВСПОМОГАТЕЛЬНЫЙ КОД ====================
 async def run_piston_code(language: str, code: str) -> str:
     url = "https://emkc.org/api/v2/piston/execute"
     lang_map = {
@@ -234,20 +209,16 @@ async def run_piston_code(language: str, code: str) -> str:
 
 
 def create_quote_card(text: str, author_name: str, avatar_bytes: bytes = None) -> io.BytesIO:
-    """Генерирует стильный постер с цитатой, аватаркой и подписью."""
     w, h = 1000, 500
     img = Image.new("RGB", (w, h), color=(18, 18, 24))
     draw = ImageDraw.Draw(img)
 
-    # Рисуем рамку и акцентную линию
     draw.rounded_rectangle([(20, 20), (w - 20, h - 20)], radius=20, outline=(45, 45, 60), width=2)
     draw.line([(50, h - 90), (w - 50, h - 90)], fill=(40, 40, 55), width=2)
 
-    # Загружаем шрифт или стандартный
     font_large = ImageFont.load_default()
     font_small = ImageFont.load_default()
 
-    # Если есть аватарка, вставляем кружочком
     if avatar_bytes:
         try:
             av = Image.open(io.BytesIO(avatar_bytes)).convert("RGBA").resize((70, 70))
@@ -257,7 +228,6 @@ def create_quote_card(text: str, author_name: str, avatar_bytes: bytes = None) -
         except Exception:
             pass
 
-    # Оформляем текст цитаты
     wrapped = textwrap.wrap(f"«{text}»", width=38)
     quote_str = "\n".join(wrapped)
 
@@ -271,14 +241,10 @@ def create_quote_card(text: str, author_name: str, avatar_bytes: bytes = None) -
 
 
 def split_text_with_markdown(text: str, limit: int = 1950) -> list[str]:
-    """Умное разбиение текста с сохранением подсветки Markdown (```)."""
     if len(text) <= limit:
         return [text]
 
     chunks = []
-    in_code_block = False
-    code_lang = ""
-
     while text:
         if len(text) <= limit:
             chunks.append(text)
@@ -293,7 +259,6 @@ def split_text_with_markdown(text: str, limit: int = 1950) -> list[str]:
         chunk = text[:split_idx]
         text = text[split_idx:].strip()
 
-        # Проверка на незакрытый кодовый блок
         code_matches = re.findall(r"```(\w*)", chunk)
         if len(code_matches) % 2 != 0:
             last_lang = code_matches[-1]
@@ -305,22 +270,7 @@ def split_text_with_markdown(text: str, limit: int = 1950) -> list[str]:
     return chunks
 
 
-# ==================== UI: ИНТЕРАКТИВНЫЕ КНОПКИ И МЕНЮ ====================
-class RunCodeButtonView(discord.ui.View):
-    def __init__(self, language: str, code: str):
-        super().__init__(timeout=300)
-        self.language = language
-        self.code = code
-
-    @discord.ui.button(label="▶️ Запустить код", style=discord.ButtonStyle.success)
-    async def run_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer()
-        out = await run_piston_code(self.language, self.code)
-        if len(out) > 1850:
-            out = out[:1850] + "\n... (хвост обрезан)"
-        await interaction.followup.send(f"💻 **Результат запуска ({self.language}):**\n```\n{out}\n```")
-
-
+# ==================== UI: ПАНЕЛЬ УПРАВЛЕНИЯ ====================
 class ControlPanelView(discord.ui.View):
     def __init__(self, settings: dict):
         super().__init__(timeout=180)
@@ -333,19 +283,26 @@ class ControlPanelView(discord.ui.View):
         new_state = not self.settings["web_search"]
         await update_setting(interaction.channel_id, "web_search", new_state)
         self.settings["web_search"] = new_state
-        await interaction.response.edit_message(embed=build_menu_embed(self.settings), view=self)
+        await self.refresh_view(interaction)
 
     @discord.ui.button(label="🎲 Спонтанность", style=discord.ButtonStyle.secondary, row=2)
     async def toggle_spontaneous(self, interaction: discord.Interaction, button: discord.ui.Button):
         new_state = not self.settings["spontaneous"]
         await update_setting(interaction.channel_id, "spontaneous", new_state)
         self.settings["spontaneous"] = new_state
-        await interaction.response.edit_message(embed=build_menu_embed(self.settings), view=self)
+        await self.refresh_view(interaction)
 
     @discord.ui.button(label="🧹 Сброс памяти", style=discord.ButtonStyle.danger, row=2)
     async def clear_mem(self, interaction: discord.Interaction, button: discord.ui.Button):
         await clear_channel_memory(interaction.channel_id)
-        await interaction.response.send_message("🧹 Память канала полностью сброшена!", ephemeral=True)
+        await interaction.response.send_message("🧹 Память диалога в этом канале очищена!", ephemeral=True)
+
+    async def refresh_view(self, interaction: discord.Interaction):
+        embed = build_menu_embed(self.settings)
+        try:
+            await interaction.response.edit_message(embed=embed, view=self)
+        except discord.Forbidden:
+            await interaction.response.edit_message(content=build_menu_text(self.settings), view=self)
 
 
 class ModelDropdown(discord.ui.Select):
@@ -358,7 +315,11 @@ class ModelDropdown(discord.ui.Select):
     async def callback(self, interaction: discord.Interaction):
         await update_setting(interaction.channel_id, "model", self.values[0])
         settings = await get_settings(interaction.channel_id)
-        await interaction.response.edit_message(embed=build_menu_embed(settings), view=ControlPanelView(settings))
+        embed = build_menu_embed(settings)
+        try:
+            await interaction.response.edit_message(embed=embed, view=ControlPanelView(settings))
+        except discord.Forbidden:
+            await interaction.response.edit_message(content=build_menu_text(settings), view=ControlPanelView(settings))
 
 
 class PersonaDropdown(discord.ui.Select):
@@ -372,7 +333,11 @@ class PersonaDropdown(discord.ui.Select):
     async def callback(self, interaction: discord.Interaction):
         await update_setting(interaction.channel_id, "persona", self.values[0])
         settings = await get_settings(interaction.channel_id)
-        await interaction.response.edit_message(embed=build_menu_embed(settings), view=ControlPanelView(settings))
+        embed = build_menu_embed(settings)
+        try:
+            await interaction.response.edit_message(embed=embed, view=ControlPanelView(settings))
+        except discord.Forbidden:
+            await interaction.response.edit_message(content=build_menu_text(settings), view=ControlPanelView(settings))
 
 
 def build_menu_embed(settings: dict) -> discord.Embed:
@@ -380,34 +345,46 @@ def build_menu_embed(settings: dict) -> discord.Embed:
     embed = discord.Embed(title="⚙️ Центр управления Стетхомом", color=discord.Color.blue())
     embed.add_field(name="🤖 Активная модель", value=f"`{settings['model']}`", inline=True)
     embed.add_field(name="🎭 Характер", value=f"**{p_name}**", inline=True)
-    embed.add_field(name="🌐 Поиск в сети", value="✅ Активен" if settings["web_search"] else "❌ Выключен", inline=True)
-    embed.add_field(name="🎲 Спонтанные реплики", value="✅ 3% (с кулдауном)" if settings["spontaneous"] else "❌ Выкл", inline=True)
-    embed.set_footer(text="Все настройки сохраняются в базу данных канала.")
+    embed.add_field(name="🌐 Поиск Google", value="✅ Включен" if settings["web_search"] else "❌ Выключен", inline=True)
+    embed.add_field(name="🎲 Спонтанность", value="✅ 3% шанс" if settings["spontaneous"] else "❌ Выключена", inline=True)
+    embed.set_footer(text="Изменения применяются для текущего канала.")
     return embed
 
 
-# ==================== ЯДРО GEMINI С GROUNDING ====================
+def build_menu_text(settings: dict) -> str:
+    p_name = PERSONAS.get(settings["persona"], {}).get("name", settings["persona"])
+    return (
+        f"⚙️ **Центр управления Стетхомом**\n"
+        f"• 🤖 **Модель:** `{settings['model']}`\n"
+        f"• 🎭 **Характер:** {p_name}\n"
+        f"• 🌐 **Поиск Google:** {'✅ Включен' if settings['web_search'] else '❌ Выключен'}\n"
+        f"• 🎲 **Спонтанность:** {'✅ Включена' if settings['spontaneous'] else '❌ Выключена'}"
+    )
+
+
+async def send_control_panel(target_message: discord.Message):
+    """Надежная отправка панели настроек с защитой от отсутствия прав на Embed."""
+    settings = await get_settings(target_message.channel.id)
+    view = ControlPanelView(settings)
+    try:
+        await target_message.reply(embed=build_menu_embed(settings), view=view)
+    except discord.Forbidden:
+        await target_message.reply(content=build_menu_text(settings), view=view)
+
+
+# ==================== ЯДРО GEMINI ====================
 async def call_gemini(model_name: str, payload: dict, headers: dict) -> tuple[bool, str, list]:
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
     try:
         async with http_session.post(url, json=payload, headers=headers) as resp:
             data = await resp.json(content_type=None)
 
-            if resp.status == 400 and "thinkingConfig" in payload.get("generationConfig", {}):
-                clean_payload = dict(payload)
-                clean_payload["generationConfig"] = {"temperature": 0.6}
-                async with http_session.post(url, json=clean_payload, headers=headers) as retry_resp:
-                    data = await retry_resp.json(content_type=None)
-                    resp = retry_resp
-
             if resp.status == 200 and "candidates" in data and len(data["candidates"]) > 0:
                 cand = data["candidates"][0]
                 cand_parts = cand.get("content", {}).get("parts", [])
                 
-                # Достаем источники Google Search (Grounding)
                 sources = []
-                grounding_chunks = cand.get("groundingMetadata", {}).get("groundingChunks", [])
-                for chunk in grounding_chunks:
+                for chunk in cand.get("groundingMetadata", {}).get("groundingChunks", []):
                     web_info = chunk.get("web", {})
                     uri = web_info.get("uri")
                     title = web_info.get("title") or uri
@@ -422,7 +399,6 @@ async def call_gemini(model_name: str, payload: dict, headers: dict) -> tuple[bo
 
             err_msg = data.get("error", {}).get("message", f"HTTP {resp.status}")
             return False, f"[{resp.status}] {err_msg}", []
-
     except Exception as e:
         return False, str(e), []
 
@@ -439,8 +415,8 @@ async def ask_ai(author: discord.User | discord.Member, user_text: str, channel:
     persona_cfg = PERSONAS.get(settings["persona"], PERSONAS["statham"])
 
     dossier = await get_user_facts(channel.guild.id if channel.guild else 0, author.id)
-    dossier_text = f"\nТвое досье на собеседника ({author.display_name}):\n{dossier}" if dossier else ""
-    vc_context = f"\n[Контекст: ты общаешься в текстовом чате голосового канала: {channel.name}]" if isinstance(channel, discord.VoiceChannel) else ""
+    dossier_text = f"\nДосье на собеседника ({author.display_name}):\n{dossier}" if dossier else ""
+    vc_context = f"\n[Ты находишься в голосовом канале: {channel.name}]" if isinstance(channel, discord.VoiceChannel) else ""
 
     system_instruction = f"{persona_cfg['prompt']}{dossier_text}{vc_context}"
 
@@ -455,7 +431,7 @@ async def ask_ai(author: discord.User | discord.Member, user_text: str, channel:
     payload = {
         "system_instruction": {"parts": [{"text": system_instruction}]},
         "contents": contents,
-        "generationConfig": {"temperature": 0.6, "thinkingConfig": {"thinkingBudget": 1024}}
+        "generationConfig": {"temperature": 0.6}
     }
 
     if settings["web_search"]:
@@ -472,7 +448,7 @@ async def ask_ai(author: discord.User | discord.Member, user_text: str, channel:
             await save_memory(channel.id, "model", "стетхом", res)
             return res, sources
         else:
-            warning_notice = f"⚠️ У `{selected}` закончились лимиты/ошибка! Переключился на автоперебор.\n\n"
+            warning_notice = f"⚠️ У `{selected}` закончились лимиты/ошибка! Переключился на автовыбор.\n\n"
             await update_setting(channel.id, "model", "auto")
             models_to_try = [m for m in MODELS_POOL if m != selected]
     else:
@@ -490,7 +466,7 @@ async def ask_ai(author: discord.User | discord.Member, user_text: str, channel:
     return warning_notice + "❌ Все доступные модели исчерпали лимиты.", []
 
 
-# ==================== DISCORD BOT И КОМАНДЫ ====================
+# ==================== DISCORD СОБЫТИЯ ====================
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
@@ -502,64 +478,17 @@ async def on_ready():
     try:
         await bot.tree.sync()
     except Exception as e:
-        print(f"Ошибка дерева команд: {e}")
-    print(f"✅ Бот {bot.user} запущен и готов разносить чат!", flush=True)
+        print(f"Ошибка синхронизации дерева команд: {e}")
+    print(f"✅ Бот {bot.user} успешно запущен и готов к работе!", flush=True)
 
 
-@bot.tree.command(name="menu", description="Панель настроек моделей, характера и поиска")
-async def cmd_menu(interaction: discord.Interaction):
+@bot.tree.command(name="menu", description="Открыть центр управления Стетхомом")
+async def slash_menu(interaction: discord.Interaction):
     settings = await get_settings(interaction.channel_id)
-    await interaction.response.send_message(embed=build_menu_embed(settings), view=ControlPanelView(settings), ephemeral=True)
-
-
-@bot.tree.command(name="quote", description="Сделать мем-цитату (можно ответить на сообщение или передать текст)")
-@app_commands.describe(text="Текст цитаты (если пусто — придумает сам)")
-async def cmd_quote(interaction: discord.Interaction, text: str = None):
-    await interaction.response.defer()
-    author_name = "Джейсон Стетхом"
-    av_bytes = None
-
-    if not text:
-        text, _ = await ask_ai(interaction.user, "Выдай одну абсурдную пацанскую цитату в одно короткое предложение.", interaction.channel)
-
-    buf = create_quote_card(text.replace("«", "").replace("»", ""), author_name, av_bytes)
-    await interaction.followup.send(file=discord.File(buf, filename="quote.png"))
-
-
-@bot.tree.command(name="dossier", description="Посмотреть досье на участника")
-@app_commands.describe(user="Пользователь")
-async def cmd_dossier(interaction: discord.Interaction, user: discord.Member = None):
-    target = user or interaction.user
-    facts = await get_user_facts(interaction.guild_id, target.id)
-    if not facts:
-        await interaction.response.send_message(f"📁 Досье на **{target.display_name}** пока пустое.", ephemeral=True)
-    else:
-        embed = discord.Embed(title=f"📁 Досье: {target.display_name}", description=facts, color=discord.Color.dark_gold())
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-
-
-@bot.tree.command(name="remember", description="Записать факт в досье")
-@app_commands.describe(user="Пользователь", fact="Что запомнить?")
-async def cmd_remember(interaction: discord.Interaction, user: discord.Member, fact: str):
-    await save_user_fact(interaction.guild_id, user.id, user.display_name, fact)
-    await interaction.response.send_message(f"📝 Записал в досье на **{user.display_name}**: *{fact}*", ephemeral=True)
-
-
-@bot.tree.command(name="forget", description="Очистить досье на пользователя")
-@app_commands.describe(user="Пользователь")
-async def cmd_forget(interaction: discord.Interaction, user: discord.Member):
-    await wipe_user_dossier(interaction.guild_id, user.id)
-    await interaction.response.send_message(f"🗑️ Досье на **{user.display_name}** очищено.", ephemeral=True)
-
-
-@bot.tree.command(name="run", description="Запустить код в песочнице")
-@app_commands.describe(language="Язык (python, js, cpp, rust, bash)", code="Код")
-async def cmd_run(interaction: discord.Interaction, language: str, code: str):
-    await interaction.response.defer()
-    out = await run_piston_code(language, code)
-    if len(out) > 1850:
-        out = out[:1850] + "\n..."
-    await interaction.followup.send(f"💻 **Результат ({language}):**\n```\n{out}\n```")
+    try:
+        await interaction.response.send_message(embed=build_menu_embed(settings), view=ControlPanelView(settings), ephemeral=True)
+    except discord.Forbidden:
+        await interaction.response.send_message(content=build_menu_text(settings), view=ControlPanelView(settings), ephemeral=True)
 
 
 @bot.event
@@ -567,132 +496,117 @@ async def on_message(message: discord.Message):
     if message.author.bot:
         return
 
-    # Текстовый вызов панели
-    if message.content.strip().lower() in ("!menu", "/menu", "стетхом меню"):
+    try:
+        content_raw = message.content.strip().lower()
+        clean_text = message.clean_content.strip().lower()
+
+        # --- НАДЕЖНЫЙ ПЕРЕХВАТ МЕНЮ ---
+        is_menu_request = (
+            content_raw in ("!menu", "/menu")
+            or "!menu" in content_raw
+            or clean_text in ("!menu", "/menu", "меню")
+            or ("меню" in clean_text and (bot.user in message.mentions or (message.reference and message.reference.resolved and message.reference.resolved.author == bot.user)))
+        )
+
+        if is_menu_request:
+            await send_control_panel(message)
+            return
+
+        # Быстрый запуск кода
+        if message.content.startswith("!run"):
+            match = re.search(r"```(\w*)\n([\s\S]*?)```", message.content)
+            if match:
+                lang, code = match.group(1) or "python", match.group(2)
+                out = await run_piston_code(lang, code)
+                await message.reply(f"```\n{out}\n```")
+                return
+
+        # Эмодзи-реакции на триггеры
+        if any(w in clean_text for w in ("кринж", "база", "стетхом одобряет", "пон", "жиза")):
+            try:
+                await message.add_reaction(random.choice(["🗿", "💀", "🤝", "🤡", "☕"]))
+            except Exception:
+                pass
+
+        is_mentioned = bot.user in message.mentions
+        is_reply = (
+            message.reference
+            and message.reference.resolved
+            and isinstance(message.reference.resolved, discord.Message)
+            and message.reference.resolved.author == bot.user
+        )
+
         settings = await get_settings(message.channel.id)
-        await message.reply(embed=build_menu_embed(settings), view=ControlPanelView(settings))
-        return
 
-    # Цитата по реплаю на чужое сообщение: "!quote" в ответ
-    if message.content.strip().lower() == "!quote" and message.reference and message.reference.resolved:
-        orig = message.reference.resolved
-        if isinstance(orig, discord.Message) and orig.content:
-            av_data = await orig.author.display_avatar.read() if orig.author.display_avatar else None
-            buf = create_quote_card(orig.content, orig.author.display_name, av_data)
-            await message.reply(file=discord.File(buf, filename="quote.png"))
+        # Спонтанные реплики (раз в 15 минут)
+        now = time.time()
+        last_time = channel_spontaneous_cooldown[message.channel.id]
+        trigger_spontaneous = (
+            settings["spontaneous"]
+            and not (is_mentioned or is_reply)
+            and len(message.content) > 15
+            and (now - last_time > 900)
+            and (random.random() < 0.03)
+        )
+
+        if trigger_spontaneous:
+            channel_spontaneous_cooldown[message.channel.id] = now
+
+        if not (is_mentioned or is_reply or trigger_spontaneous):
             return
 
-    # Быстрый запуск кода через markdown-блоки
-    if message.content.startswith("!run"):
-        match = re.search(r"```(\w*)\n([\s\S]*?)```", message.content)
-        if match:
-            lang, code = match.group(1) or "python", match.group(2)
-            out = await run_piston_code(lang, code)
-            await message.reply(f"```\n{out}\n```")
-            return
+        user_query = message.clean_content.replace(f"@{bot.user.display_name}", "").strip()
 
-    # Эмодзи-реакции на триггеры
-    lowered = message.content.lower()
-    if any(w in lowered for w in ("кринж", "база", "стетхом одобряет", "пон", "жиза")):
-        try:
-            await message.add_reaction(random.choice(["🗿", "💀", "🤝", "🤡", "☕"]))
-        except Exception:
-            pass
+        # Сбор файлов (включая аудио и голосовые)
+        file_parts = []
+        attachments = list(message.attachments)
+        if message.reference and isinstance(message.reference.resolved, discord.Message):
+            attachments.extend(message.reference.resolved.attachments)
 
-    is_mentioned = bot.user in message.mentions
-    is_reply = (
-        message.reference
-        and message.reference.resolved
-        and isinstance(message.reference.resolved, discord.Message)
-        and message.reference.resolved.author == bot.user
-    )
+        for att in attachments:
+            if att.size > 15 * 1024 * 1024:
+                continue
+            fn = att.filename.lower()
+            ct = att.content_type or ""
+            try:
+                b = await att.read()
+                if ct.startswith("image/") or fn.endswith((".png", ".jpg", ".jpeg", ".webp")):
+                    mime = ct if ct.startswith("image/") else "image/jpeg"
+                    file_parts.append({"inlineData": {"mimeType": mime, "data": base64.b64encode(b).decode()}})
+                elif ct.startswith("audio/") or fn.endswith(AUDIO_EXTENSIONS):
+                    mime = ct if ct.startswith("audio/") else "audio/ogg"
+                    file_parts.append({"inlineData": {"mimeType": mime, "data": base64.b64encode(b).decode()}})
+                elif fn.endswith(".pdf") or ct == "application/pdf":
+                    file_parts.append({"inlineData": {"mimeType": "application/pdf", "data": base64.b64encode(b).decode()}})
+                elif fn.endswith(TEXT_EXTENSIONS):
+                    file_parts.append({"text": f"\n\n[Файл {att.filename}]:\n{b.decode('utf-8', errors='replace')}\n"})
+            except Exception as e:
+                print(f"Ошибка чтения файла: {e}")
 
-    settings = await get_settings(message.channel.id)
+        if not user_query:
+            user_query = "Что на файле/аудио?" if file_parts else "Ты тут?"
 
-    # Спонтанные реплики с кулдауном 15 минут
-    now = time.time()
-    last_time = channel_spontaneous_cooldown[message.channel.id]
-    trigger_spontaneous = (
-        settings["spontaneous"]
-        and not (is_mentioned or is_reply)
-        and len(message.content) > 15
-        and (now - last_time > 900)
-        and (random.random() < 0.03)
-    )
+        async with message.channel.typing():
+            answer, sources = await ask_ai(message.author, user_query, message.channel, file_parts)
 
-    if trigger_spontaneous:
-        channel_spontaneous_cooldown[message.channel.id] = now
+        if sources:
+            source_links = "\n".join([f"• [{title}]({uri})" for title, uri in sources[:4]])
+            answer += f"\n\n🌐 **Источники:**\n{source_links}"
 
-    if not (is_mentioned or is_reply or trigger_spontaneous):
-        return
+        chunks = split_text_with_markdown(answer)
+        for i, chunk in enumerate(chunks):
+            if i == 0:
+                await message.reply(chunk)
+            else:
+                await message.channel.send(chunk)
 
-    clean_text = message.clean_content.replace(f"@{bot.user.display_name}", "").strip()
-
-    # Сбор и обработка вложений (Изображения, PDF, Код, Голосовые/Аудио)
-    file_parts = []
-    attachments = list(message.attachments)
-    if message.reference and isinstance(message.reference.resolved, discord.Message):
-        attachments.extend(message.reference.resolved.attachments)
-
-    for att in attachments:
-        if att.size > 15 * 1024 * 1024:
-            continue
-        fn = att.filename.lower()
-        ct = att.content_type or ""
-
-        try:
-            b = await att.read()
-            # Картинки
-            if ct.startswith("image/") or fn.endswith((".png", ".jpg", ".jpeg", ".webp")):
-                mime = ct if ct.startswith("image/") else "image/jpeg"
-                file_parts.append({"inlineData": {"mimeType": mime, "data": base64.b64encode(b).decode()}})
-            # Голосовые сообщения и аудио
-            elif ct.startswith("audio/") or fn.endswith(AUDIO_EXTENSIONS):
-                mime = ct if ct.startswith("audio/") else "audio/ogg"
-                file_parts.append({"inlineData": {"mimeType": mime, "data": base64.b64encode(b).decode()}})
-            # PDF
-            elif fn.endswith(".pdf") or ct == "application/pdf":
-                file_parts.append({"inlineData": {"mimeType": "application/pdf", "data": base64.b64encode(b).decode()}})
-            # Текстовые файлы и код
-            elif fn.endswith(TEXT_EXTENSIONS):
-                file_parts.append({"text": f"\n\n[Файл {att.filename}]:\n{b.decode('utf-8', errors='replace')}\n"})
-        except Exception as e:
-            print(f"Ошибка чтения вложения: {e}")
-
-    # Парсинг ссылок из текста
-    urls = re.findall(r"https?://[^\s]+", clean_text)
-    for u in urls[:2]:
-        page_text = await fetch_web_page(u)
-        if page_text:
-            file_parts.append({"text": f"\n\n[Содержимое страницы {u}]:\n{page_text}\n"})
-
-    if not clean_text:
-        clean_text = "Что на прикрепленном файле/аудио?" if file_parts else "Ты тут?"
-
-    async with message.channel.typing():
-        answer, sources = await ask_ai(message.author, clean_text, message.channel, file_parts)
-
-    # Прикрепляем кликабельные источники Google Search
-    if sources:
-        source_links = "\n".join([f"• [{title}]({uri})" for title, uri in sources[:4]])
-        answer += f"\n\n🌐 **Источники:**\n{source_links}"
-
-    # Проверяем, есть ли в ответе сгенерированный код, чтобы добавить кнопку запуска
-    code_match = re.search(r"```(\w+)\n([\s\S]*?)```", answer)
-    run_view = RunCodeButtonView(code_match.group(1), code_match.group(2)) if code_match else None
-
-    chunks = split_text_with_markdown(answer)
-    for i, chunk in enumerate(chunks):
-        view_to_attach = run_view if (i == len(chunks) - 1 and run_view) else None
-        if i == 0:
-            await message.reply(chunk, view=view_to_attach)
-        else:
-            await message.channel.send(chunk, view=view_to_attach)
+    except Exception as e:
+        print(f"❌ Ошибка в on_message: {e}", flush=True)
 
 
-# ==================== KEEP-ALIVE ВЕБ-СЕРВЕР ====================
+# ==================== KEEPALIVE СЕРВЕР ====================
 async def handle(request):
-    return web.Response(text="Bot is running smoothly 24/7!")
+    return web.Response(text="Bot is alive 24/7!")
 
 
 async def main():
